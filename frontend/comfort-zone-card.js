@@ -63,7 +63,8 @@
       this._config = config;
       this._draft = null;       // local schedule edits (null = follow the entity)
       this._dragging = false;
-      this._activeEdit = null;  // {i, t} of the point being dragged (for the value badge)
+      this._activeEdit = null;  // {i, t} of the point being dragged/hovered (value badge)
+      this._hoverI = null;      // last hovered slot index (mouse, non-destructive readout)
       this._lastSig = null;
       this._actual = null;      // cached actual-comfort trace for today [{hf, t}]
       this._actualFetchedAt = 0;
@@ -267,11 +268,12 @@
       // "idle" already reads "On target"; don't double it up.
       const pillLabel = mode === "idle" ? meta.label : meta.label + (onTarget ? " · on target" : "");
 
-      const pdelta = fnum(a.power_delta);
+      const pdelta = fnum(a.power_delta);   // coordinator-derived (per tick, by design)
       const parrow = pdelta == null || Math.abs(pdelta) < 40 ? "" :
         (pdelta > 0 ? `<span class="up">▲</span>` : `<span class="dn">▼</span>`);
-      const power = fnum(a.power);
-      const slope = fnum(a.slope);
+      // POWER value read live from the sensor (real-time), not the tick snapshot.
+      const power = em.power ? (fnum(this._st(em.power)?.state) ?? fnum(a.power)) : fnum(a.power);
+      const slope = fnum(a.slope);          // coordinator-derived (5-min window)
       const feelEnt = em.comfort || em.temp || this._ent.comfort || this._config.zone;
 
       // chip(): `ent` (optional) makes it open that entity's native HA history.
@@ -281,23 +283,34 @@
           <span class="k">${label}</span><span class="v">${val}</span></div>`;
       };
 
-      // AC state chip — reflects what the AC is ACTUALLY doing, distinct from the
-      // controller mode (the AC keeps cooling on its own while the mode is idle).
+      // AC state chip — read LIVE from the climate entity (real-time), falling
+      // back to the tick snapshot. Reflects what the AC is actually doing,
+      // distinct from the controller mode (the AC keeps cooling while idle).
+      const acSt = this._st(em.ac);
+      const acOn = acSt ? !["off", "unavailable", "unknown"].includes(acSt.state) : a.ac_on;
+      const acState = acSt ? acSt.state : a.ac_state;
+      const acSetpoint = acSt ? fnum(acSt.attributes.temperature) : a.setpoint;
+      const acBlower = acSt ? acSt.attributes.fan_mode : a.ac_blower;
       let acChip;
-      if (a.ac_on) {
-        const st = a.ac_state && a.ac_state !== "cool" ? a.ac_state : "cool";
-        const parts = [st, a.setpoint != null ? `${a.setpoint}°` : "", a.ac_blower || ""].filter(Boolean);
+      if (acOn) {
+        const st = acState && acState !== "cool" ? acState : "cool";
+        const parts = [st, acSetpoint != null ? `${acSetpoint}°` : "", acBlower || ""].filter(Boolean);
         acChip = chip("ac", parts.join(" "), "", em.ac);
       } else {
         acChip = chip("ac", "off", "soft", em.ac);
       }
 
-      // Fan chip — reflects the circulation fan's real on/off + assist toggle.
+      // Fan chip — LIVE from the fan + speed entities and the fan-assist switch.
+      const fanSt = this._st(em.fan);
+      const fanOnLive = fanSt ? fanSt.state === "on" : a.fan_on;
+      const fanLevelLive = em.fan_speed ? fnum(this._st(em.fan_speed)?.state) : a.fan_level;
+      const fanAssistSt = this._st(this._ent.fanAssist);
+      const fanAssistOn = fanAssistSt ? fanAssistSt.state === "on" : (a.fan_assist_enabled !== false);
       let fanChip;
-      if (a.fan_assist_enabled === false) {
+      if (!fanAssistOn) {
         fanChip = chip("fan", "assist off", "soft", em.fan);
-      } else if (a.fan_on) {
-        fanChip = chip("fan", `${a.fan_level != null ? a.fan_level : "on"}`, "", em.fan);
+      } else if (fanOnLive) {
+        fanChip = chip("fan", `${fanLevelLive != null ? fanLevelLive : "on"}`, "", em.fan);
       } else {
         fanChip = chip("fan", "off", "soft", em.fan);
       }
@@ -587,16 +600,30 @@
         this._renderScheduleQuiet(status);
       };
       svg.addEventListener("pointerdown", (ev) => {
-        ev.preventDefault(); this._dragging = true; lastI = null;
+        ev.preventDefault(); this._dragging = true; lastI = null; this._hoverI = null;
         svg.setPointerCapture(ev.pointerId); paint(ev);
       });
-      svg.addEventListener("pointermove", (ev) => { if (this._dragging) paint(ev); });
+      svg.addEventListener("pointermove", (ev) => {
+        if (this._dragging) { paint(ev); return; }
+        // Hover (mouse only): show the point's EXISTING value — non-destructive.
+        const { i } = evToVal(ev);
+        if (i === this._hoverI) return;
+        this._hoverI = i;
+        const data = this._schedData(status);
+        this._activeEdit = { i, t: data[i] };
+        this._renderScheduleQuiet(status);
+      });
       const end = () => {
-        this._dragging = false; lastI = null; this._activeEdit = null;
+        this._dragging = false; lastI = null; this._activeEdit = null; this._hoverI = null;
         this._renderScheduleQuiet(status);  // clear the badge
       };
       svg.addEventListener("pointerup", end);
       svg.addEventListener("pointercancel", end);
+      svg.addEventListener("pointerleave", () => {
+        if (this._dragging || this._activeEdit == null) return;
+        this._hoverI = null; this._activeEdit = null;
+        this._renderScheduleQuiet(status);   // hide the badge when the pointer leaves
+      });
     }
 
     // re-render only the SVG paths during a drag (cheap, no listener churn cost matters)
