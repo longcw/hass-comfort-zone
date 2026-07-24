@@ -55,13 +55,19 @@ async def _async_register_services(hass: "HomeAssistant") -> None:
         await async_identify_service(hass, call)
 
     async def _set_schedule(call):
-        """Persist a zone's 48-point target curve (from the card)."""
+        """Persist a zone's 48-point target curve for its current strategy."""
+        from .const import OPT_STRATEGY
+
         name = call.data.get("name")
         schedule = call.data["schedule"]
+        strategy = call.data.get("strategy")
         for coord in hass.data.get(DOMAIN, {}).values():
             if name in (None, coord.zone_name):
-                await coord.store.set_schedule([float(x) for x in schedule])
+                strat = strategy or coord.options()[OPT_STRATEGY]
+                await coord.store.set_schedule([float(x) for x in schedule], strat)
                 await coord.async_request_refresh()
 
     hass.services.async_register(DOMAIN, "identify_model", _identify)
     hass.services.async_register(DOMAIN, "set_schedule", _set_schedule)
+    # Note: continuous self-evolution happens online in the coordinator
+    # (see adapt.OnlineAdapter). `identify_model` is a manual full-history refit.

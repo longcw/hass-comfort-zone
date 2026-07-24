@@ -38,7 +38,8 @@ OPT_COMFORT_K: Final = "comfort_k"                 # humidity weight, 0..1
 OPT_COMFORT_RH_REF: Final = "comfort_rh_ref"       # anchor RH (signal == raw temp here)
 
 # Band / setpoint envelope.
-OPT_BAND: Final = "band"                           # ± tolerance around target, °C
+OPT_BAND: Final = "band"                           # ± tolerance around target, °C (fan-assist on)
+OPT_BAND_NO_FAN: Final = "band_no_fan"             # tighter ± tolerance when fan-assist is off
 OPT_SETPOINT_MIN: Final = "setpoint_min"
 OPT_SETPOINT_MAX: Final = "setpoint_max"
 
@@ -120,6 +121,7 @@ OPTION_DEFAULTS: Final = {
     OPT_COMFORT_K: 0.35,
     OPT_COMFORT_RH_REF: 55.0,
     OPT_BAND: 0.4,
+    OPT_BAND_NO_FAN: 0.3,
     OPT_SETPOINT_MIN: 24,
     OPT_SETPOINT_MAX: 27,
     OPT_FAN_MIN_LEVEL: 10,
@@ -146,6 +148,7 @@ MODE_FAN_ASSIST: Final = "fan_assist"
 MODE_MANAGED_OFF: Final = "managed_off"
 MODE_SAFETY_OVERHEAT: Final = "safety_overheat"
 MODE_SAFETY_OVERCOOL: Final = "safety_overcool"
+MODE_STALE_HOLD: Final = "stale_hold"
 MODE_FAILSAFE: Final = "failsafe"
 
 # Signals that mean an entity is not usable this tick.

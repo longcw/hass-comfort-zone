@@ -54,9 +54,12 @@ class _StatusSensor(ComfortZoneEntity, SensorEntity):
     @property
     def extra_state_attributes(self):
         s = self._snap
+        strategy = s.get("strategy", "baby")
+        entities = dict(s.get("entities") or {})
+        entities["status"] = self.entity_id  # the card wires clicks off this
         return {
             "reason": s.get("reason"),
-            "strategy": s.get("strategy"),
+            "strategy": strategy,
             "safety_state": s.get("safety_state"),
             "enabled": s.get("enabled"),
             "is_night": s.get("is_night"),
@@ -65,9 +68,15 @@ class _StatusSensor(ComfortZoneEntity, SensorEntity):
             "power_delta": round(s["power_delta"]) if isinstance(s.get("power_delta"), (int, float)) else None,
             "setpoint": s.get("setpoint"),
             "fan_level": s.get("fan_level"),
+            "fan_on": s.get("fan_on"),
+            "fan_assist_enabled": s.get("fan_assist_enabled"),
+            "ac_on": s.get("ac_on"),
+            "ac_state": s.get("ac_state"),
+            "ac_blower": s.get("ac_blower"),
             "band": s.get("band"),
             "last_actions": s.get("last_actions"),
+            "entities": entities,
             # consumed by the custom card:
-            "schedule": self.coordinator.store.schedule,
+            "schedule": self.coordinator.store.schedule_for(strategy),
             "recent_log": self.coordinator.store.log[-20:],
         }

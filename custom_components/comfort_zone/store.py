@@ -27,8 +27,15 @@ class ZoneStore:
     async def load(self) -> None:
         self._data = await self._store.async_load() or {}
         self._data.setdefault("model", dict(MODEL_DEFAULTS))
-        self._data.setdefault("schedule", [DEFAULT_TARGET] * SCHEDULE_POINTS)
         self._data.setdefault("log", [])
+        # Schedules are per-strategy so the target curve binds to the preset.
+        # Migrate an older single-list schedule by seeding it under every key.
+        if not isinstance(self._data.get("schedules"), dict):
+            legacy = self._data.get("schedule")
+            base = legacy if isinstance(legacy, list) and len(legacy) == SCHEDULE_POINTS \
+                else [DEFAULT_TARGET] * SCHEDULE_POINTS
+            self._data["schedules"] = {"_default": base}
+            self._data.pop("schedule", None)
 
     async def _save(self) -> None:
         await self._store.async_save(self._data)
@@ -42,22 +49,23 @@ class ZoneStore:
         self._data["model"] = dict(model)
         await self._save()
 
-    # -- schedule (48 × 30-min points) --------------------------------------
-    @property
-    def schedule(self) -> list[float]:
-        sched = self._data.get("schedule") or [DEFAULT_TARGET] * SCHEDULE_POINTS
+    # -- schedule (48 × 30-min points), per strategy ------------------------
+    def schedule_for(self, strategy: str) -> list[float]:
+        schedules = self._data.get("schedules", {})
+        sched = schedules.get(strategy) or schedules.get("_default") \
+            or [DEFAULT_TARGET] * SCHEDULE_POINTS
         if len(sched) != SCHEDULE_POINTS:
-            sched = (sched + [DEFAULT_TARGET] * SCHEDULE_POINTS)[:SCHEDULE_POINTS]
-        return sched
+            sched = (list(sched) + [DEFAULT_TARGET] * SCHEDULE_POINTS)[:SCHEDULE_POINTS]
+        return list(sched)
 
-    async def set_schedule(self, schedule: list[float]) -> None:
-        self._data["schedule"] = list(schedule)[:SCHEDULE_POINTS]
+    async def set_schedule(self, schedule: list[float], strategy: str) -> None:
+        self._data.setdefault("schedules", {})[strategy] = list(schedule)[:SCHEDULE_POINTS]
         await self._save()
 
-    def target_at(self, hour: int, minute: int) -> float:
+    def target_at(self, hour: int, minute: int, strategy: str) -> float:
         idx = (hour * 60 + minute) // 30
         idx = max(0, min(SCHEDULE_POINTS - 1, idx))
-        return float(self.schedule[idx])
+        return float(self.schedule_for(strategy)[idx])
 
     # -- decision log -------------------------------------------------------
     @property

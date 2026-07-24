@@ -137,14 +137,52 @@ def test_safety_overheat_overrides():
     check(out.set_ac_power is True and out.set_fan is True, "overheat forces AC+fan on")
 
 
-def test_safety_stale_failsafe():
+def test_safety_stale_with_value_holds():
+    # a value present but no fresh report → freeze, don't disrupt
     g = SafetyGuard()
     sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
     opt = Command(mode=const.MODE_COOLING, set_setpoint=24)
     out = g.evaluate(sig(comfort=26.0), params(), sp, opt, stale=True)
+    check(out.mode == const.MODE_STALE_HOLD, f"expected stale_hold, got {out.mode}")
+    check(out.set_setpoint is None and out.set_fan is None, "stale hold must change nothing")
+
+
+def test_safety_unavailable_parks_at_floor():
+    # no value at all → park at floor(target - band), fan off
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
+    opt = Command(mode=const.MODE_COOLING, set_setpoint=24)
+    out = g.evaluate(sig(comfort=None), params(target=26.0, band=0.4), sp, opt, stale=True)
     check(out.mode == const.MODE_FAILSAFE, f"expected failsafe, got {out.mode}")
-    check(out.set_setpoint == 26, "failsafe parks at a safe fixed setpoint")
+    check(out.set_setpoint == 25, f"park at floor(26-0.4)=25, got {out.set_setpoint}")
     check(out.set_fan is False, "failsafe stops the fan")
+
+
+def test_fan_disabled_never_runs_fan():
+    c = fresh()
+    p = params()
+    p.fan_assist_enabled = False
+    # mildly warm — would normally turn the fan on
+    cmd = c.tick(sig(comfort=26.3, fan_on=False), p)
+    check(cmd.set_fan is not True, f"fan must not turn on when fan-assist disabled, got {cmd.set_fan}")
+    # and if it were on, it gets turned off
+    cmd = c.tick(sig(comfort=26.3, fan_on=True), p)
+    check(cmd.set_fan is False, "fan-assist disabled should turn a running fan off")
+
+
+def test_adapter_learns_gain():
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    m = ModelParams()  # gain 0.5, dead 10, tau 8
+    a = OnlineAdapter(m)
+    a.on_setpoint_command(T0, delta_c=-1, comfort=27.0)
+    # a 1°C step that actually dropped comfort ~1.0°C → realized gain ~1.0 > 0.5
+    mature = T0 + timedelta(minutes=30)
+    # feed a falling slope so dead-time is captured
+    a.observe(T0 + timedelta(minutes=6), comfort=26.7, slope=-0.05)
+    changed = a.observe(mature, comfort=26.0, slope=-0.01)
+    check(changed, "adapter should update on a matured episode")
+    check(m.gain_per_step > 0.5, f"gain should rise toward realized ~1.0, got {m.gain_per_step}")
 
 
 def test_safety_normal_passthrough():

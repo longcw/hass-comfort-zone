@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .actuators import Bindings, apply
+from .adapt import OnlineAdapter
 from .comfort import comfort_temp
 from .const import (
     CONF_AC_CLIMATE,
@@ -33,6 +34,7 @@ from .const import (
     DOMAIN,
     MODE_IDLE,
     OPT_BAND,
+    OPT_BAND_NO_FAN,
     OPT_COMFORT_K,
     OPT_COMFORT_RH_REF,
     OPT_FAN_MAX_DAY,
@@ -61,7 +63,16 @@ _LOGGER = logging.getLogger(__name__)
 
 BLOWER_ORDER = ["低风", "中风", "高风"]  # ascending cooling intensity (subset of VRF modes)
 SLOPE_WINDOW_MIN = 5.0
-STALE_AFTER_S = 600
+# How long without a *fresh report* before we stop trusting the reading. Wide
+# enough to tolerate normal BLE gaps (the crib thermometer can go quiet ~10 min);
+# a value present but merely quiet only freezes control, it does not disrupt.
+STALE_AFTER_S = 1200
+
+
+def _report_age(state, now) -> float:
+    """Seconds since the entity last *reported* (any write), not just changed."""
+    ts = getattr(state, "last_reported", None) or state.last_updated
+    return (now - ts).total_seconds()
 
 
 def _fnum(state) -> float | None:
@@ -85,9 +96,11 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         )
         self.store = ZoneStore(hass, entry.entry_id)
         self.enabled = True
+        self.fan_assist = True
         self._predictor: FopdtPredictor | None = None
         self._controller: Controller | None = None
         self._safety = SafetyGuard()
+        self._adapter: OnlineAdapter | None = None
         self._comfort_hist: deque = deque(maxlen=64)
         self._power_hist: deque = deque(maxlen=256)
 
@@ -105,9 +118,13 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
     def reload_model(self) -> None:
         self._predictor = FopdtPredictor(ModelParams.from_dict(self.store.model))
         self._controller = Controller(self._predictor)
+        self._adapter = OnlineAdapter(self._predictor.params)
 
     def set_enabled(self, value: bool) -> None:
         self.enabled = value
+
+    def set_fan_assist(self, value: bool) -> None:
+        self.fan_assist = value
 
     # -- option resolution --------------------------------------------------
     def options(self) -> dict:
@@ -136,14 +153,15 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         if source == "sensor":
             st = self.hass.states.get(self.entry.data[CONF_COMFORT_SENSOR])
             val = _fnum(st)
-            stale = st is None or (now - st.last_updated).total_seconds() > STALE_AFTER_S
-            return val, stale
+            if val is None:
+                return None, True   # unavailable → park (handled in safety)
+            return val, _report_age(st, now) > STALE_AFTER_S
         t_st = self.hass.states.get(self.entry.data[CONF_TEMP_SENSOR])
         h_st = self.hass.states.get(self.entry.data[CONF_HUMIDITY_SENSOR])
         t, rh = _fnum(t_st), _fnum(h_st)
         if t is None or rh is None:
             return None, True
-        stale = (now - t_st.last_updated).total_seconds() > STALE_AFTER_S
+        stale = _report_age(t_st, now) > STALE_AFTER_S or _report_age(h_st, now) > STALE_AFTER_S
         return comfort_temp(t, rh, opts[OPT_COMFORT_K], opts[OPT_COMFORT_RH_REF]), stale
 
     def _slope(self, comfort: float | None, now) -> float | None:
@@ -202,18 +220,20 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             fan_level = int(lv) if lv is not None else None
 
         local = dt_util.now()
-        target = self.store.target_at(local.hour, local.minute)
+        target = self.store.target_at(local.hour, local.minute, opts[OPT_STRATEGY])
         is_night = self._is_night(opts)
 
+        band = float(opts[OPT_BAND_NO_FAN]) if not self.fan_assist else float(opts[OPT_BAND])
         params = ZoneParams(
             target=target,
-            band=float(opts[OPT_BAND]),
+            band=band,
             setpoint_min=int(opts[OPT_SETPOINT_MIN]),
             setpoint_max=int(opts[OPT_SETPOINT_MAX]),
             blower_levels=blower_levels,
             fan_min_level=int(opts[OPT_FAN_MIN_LEVEL]),
             fan_max_level=int(opts[OPT_FAN_MAX_NIGHT] if is_night else opts[OPT_FAN_MAX_DAY]),
             managed_off_max_min=float(opts[OPT_MANAGED_OFF_MAX_MIN]),
+            fan_assist_enabled=self.fan_assist,
         )
         signals = Signals(
             now=now, comfort=comfort, slope=slope, power=power, power_delta=power_delta,
@@ -222,9 +242,27 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         )
         predicted = self._predictor.predict_settled(now, comfort) if comfort is not None else None
 
+        dev = {
+            "ac_on": ac_on,
+            "ac_state": climate_st.state if climate_st else None,
+            "ac_blower": (climate_st.attributes.get("fan_mode") if climate_st else None),
+            "fan_on": fan_on,
+            "entities": {
+                "status": f"sensor.{self.entry.entry_id}",  # replaced by real id in sensor.py
+                "ac": d[CONF_AC_CLIMATE],
+                "ac_power_switch": d.get(CONF_AC_POWER_SWITCH),
+                "power": d.get(CONF_AC_POWER_SENSOR),
+                "fan": d.get(CONF_FAN),
+                "fan_speed": d.get(CONF_FAN_SPEED_NUMBER),
+                "temp": d.get(CONF_TEMP_SENSOR),
+                "humidity": d.get(CONF_HUMIDITY_SENSOR),
+                "comfort": d.get(CONF_COMFORT_SENSOR),
+            },
+        }
+
         if not self.enabled:
             return self._snapshot(opts, signals, target, predicted, MODE_IDLE,
-                                  "disabled — not actuating", is_night, [])
+                                  "disabled — not actuating", is_night, [], dev)
 
         opt_cmd = self._controller.tick(signals, params)
         sp = SafetyParams(
@@ -259,9 +297,22 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             })
             _LOGGER.info("%s: %s — %s", self.zone_name, cmd.reason, ", ".join(actions))
 
-        return self._snapshot(opts, signals, target, predicted, cmd.mode, cmd.reason, is_night, actions)
+        # --- online self-evolution: learn only from clean, normal-state acts ---
+        if self._safety.state == "normal":
+            if cmd.set_ac_power is False:
+                self._adapter.cancel()
+            elif cmd.set_setpoint is not None and signals.setpoint is not None:
+                self._adapter.on_setpoint_command(now, cmd.set_setpoint - signals.setpoint, comfort)
+        else:
+            self._adapter.cancel()
+        if self._adapter.observe(now, comfort, slope):
+            await self.store.set_model(self._predictor.params.to_dict())
+            _LOGGER.info("%s: adapted model → %s", self.zone_name, self._predictor.params.to_dict())
 
-    def _snapshot(self, opts, signals, target, predicted, mode, reason, is_night, actions):
+        return self._snapshot(opts, signals, target, predicted, cmd.mode, cmd.reason,
+                              is_night, actions, dev)
+
+    def _snapshot(self, opts, signals, target, predicted, mode, reason, is_night, actions, dev):
         return {
             "name": self.zone_name,
             "enabled": self.enabled,
@@ -274,10 +325,16 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             "power_delta": signals.power_delta,
             "setpoint": signals.setpoint,
             "fan_level": signals.fan_level,
+            "fan_on": dev["fan_on"],
+            "fan_assist_enabled": self.fan_assist,
+            "ac_on": dev["ac_on"],
+            "ac_state": dev["ac_state"],
+            "ac_blower": dev["ac_blower"],
             "mode": mode,
             "reason": reason,
             "strategy": opts[OPT_STRATEGY],
             "safety_state": self._safety.state,
             "is_night": is_night,
             "last_actions": actions,
+            "entities": dev["entities"],
         }

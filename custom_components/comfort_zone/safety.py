@@ -18,18 +18,25 @@ Lessons from the prior 安全阈值 that oscillated are baked in:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
-from .const import MODE_FAILSAFE, MODE_SAFETY_OVERCOOL, MODE_SAFETY_OVERHEAT
+from .const import (
+    MODE_FAILSAFE,
+    MODE_SAFETY_OVERCOOL,
+    MODE_SAFETY_OVERHEAT,
+    MODE_STALE_HOLD,
+)
 from .controller import Command, Signals, ZoneParams
 
 RELEASE_HYST = 0.3        # °C back inside the rail before releasing
-FAILSAFE_SETPOINT = 26    # parked setpoint when the sensor is unusable
+FAILSAFE_SETPOINT = 26    # parked setpoint when the sensor is truly gone
 
 STATE_NORMAL = "normal"
 STATE_OVERHEAT = "overheat"
 STATE_OVERCOOL = "overcool"
+STATE_STALE = "stale"
 STATE_FAILSAFE = "failsafe"
 
 
@@ -65,18 +72,38 @@ class SafetyGuard:
         *,
         stale: bool = False,
     ) -> Command:
-        """Return the command to actually apply (opt_cmd unless overridden)."""
+        """Return the command to actually apply (opt_cmd unless overridden).
+
+        Two distinct sensor problems, handled very differently:
+
+        * **No value** (``comfort is None`` — the source is unavailable/unknown):
+          the sensor is genuinely gone, so park the AC at a safe fixed setpoint.
+        * **A value, but no fresh report for a while** (``stale``): the room was
+          probably fine and the sensor just went quiet (common with BLE). Do NOT
+          disrupt a working room — simply HOLD (actuate nothing) until it
+          reports again.
+        """
         now = s.now
 
-        # --- stale / missing sensor: park safely, don't optimize -----------
-        if stale or s.comfort is None:
+        # --- truly gone: no value at all → park safely ---------------------
+        if s.comfort is None:
             self._enter(STATE_FAILSAFE, now)
+            park = int(math.floor(p.target - p.band))
+            park = max(p.setpoint_min, min(p.setpoint_max, park))
             return Command(
                 mode=MODE_FAILSAFE,
-                reason="sensor stale/unavailable → park AC, stop optimizing",
-                set_setpoint=FAILSAFE_SETPOINT,
-                set_ac_power=None,  # leave power as-is; just fix the setpoint
+                reason=f"sensor unavailable → park AC at floor(target−band)={park}, fan off",
+                set_setpoint=park,
+                set_ac_power=None,   # leave power as-is; just fix the setpoint
                 set_fan=False,
+            )
+
+        # --- has a value but stale: freeze, change nothing -----------------
+        if stale:
+            self._enter(STATE_STALE, now)
+            return Command(
+                mode=MODE_STALE_HOLD,
+                reason=f"no fresh reading for a while (last {s.comfort:.2f}) → hold, no changes",
             )
 
         y = s.comfort
@@ -95,8 +122,8 @@ class SafetyGuard:
                     opt_cmd.set_ac_power = True
             else:
                 return self._overcool_cmd(s, y, sp)
-        elif self.state == STATE_FAILSAFE:
-            self._enter(STATE_NORMAL, now)  # sensor came back
+        elif self.state in (STATE_FAILSAFE, STATE_STALE):
+            self._enter(STATE_NORMAL, now)  # sensor came back / reports again
 
         # --- trip logic (enter a protect state) ----------------------------
         if y > sp.hard_max:

@@ -80,6 +80,36 @@ class ComfortZoneConfigFlow(ConfigFlow, domain=DOMAIN):
             })
         return self.async_show_form(step_id="signal", data_schema=schema)
 
+    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
+        """Re-bind this zone's devices/sensors after setup (swap a fan, etc.)."""
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        cur = dict(entry.data)
+
+        if user_input is not None:
+            return self.async_update_reload_and_abort(entry, data={**cur, **user_input})
+
+        source = cur.get(CONF_COMFORT_SOURCE, "compute")
+
+        def d(key):
+            """Pre-fill an optional binding only if it is currently set."""
+            v = cur.get(key)
+            return {"default": v} if v else {}
+
+        fields: dict = {
+            vol.Required(CONF_AC_CLIMATE, default=cur.get(CONF_AC_CLIMATE)): _entity("climate"),
+            vol.Optional(CONF_AC_POWER_SWITCH, **d(CONF_AC_POWER_SWITCH)): _entity("switch"),
+            vol.Optional(CONF_AC_POWER_SENSOR, **d(CONF_AC_POWER_SENSOR)): _entity("sensor"),
+            vol.Optional(CONF_FAN, **d(CONF_FAN)): _entity("fan"),
+            vol.Optional(CONF_FAN_SPEED_NUMBER, **d(CONF_FAN_SPEED_NUMBER)): _entity("number"),
+        }
+        if source == "sensor":
+            fields[vol.Required(CONF_COMFORT_SENSOR, default=cur.get(CONF_COMFORT_SENSOR))] = _entity("sensor")
+        else:
+            fields[vol.Required(CONF_TEMP_SENSOR, default=cur.get(CONF_TEMP_SENSOR))] = _entity("sensor")
+            fields[vol.Required(CONF_HUMIDITY_SENSOR, default=cur.get(CONF_HUMIDITY_SENSOR))] = _entity("sensor")
+
+        return self.async_show_form(step_id="reconfigure", data_schema=vol.Schema(fields))
+
     @staticmethod
     @callback
     def async_get_options_flow(entry: ConfigEntry) -> OptionsFlow:

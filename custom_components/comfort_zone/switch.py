@@ -14,7 +14,7 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([_EnableSwitch(coordinator)])
+    async_add_entities([_EnableSwitch(coordinator), _FanAssistSwitch(coordinator)])
 
 
 class _EnableSwitch(ComfortZoneEntity, SwitchEntity):
@@ -33,4 +33,25 @@ class _EnableSwitch(ComfortZoneEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.set_enabled(False)
+        await self.coordinator.async_request_refresh()
+
+
+class _FanAssistSwitch(ComfortZoneEntity, SwitchEntity):
+    """Enable/disable the circulation fan. When off, the AC runs a tighter band."""
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "fan_assist")
+        self._attr_name = "Fan assist"
+        self._attr_icon = "mdi:fan"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.fan_assist
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.set_fan_assist(True)
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.set_fan_assist(False)
         await self.coordinator.async_request_refresh()

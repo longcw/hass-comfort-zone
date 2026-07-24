@@ -22,10 +22,25 @@
           "temp_sensor": "Temperature sensor",
           "humidity_sensor": "Humidity sensor"
         }
+      },
+      "reconfigure": {
+        "title": "Re-bind devices",
+        "description": "Change the AC, fan, power, or sensors this zone controls (e.g. after swapping a fan).",
+        "data": {
+          "ac_climate": "AC climate entity",
+          "ac_power_switch": "AC reliable power switch",
+          "ac_power_sensor": "AC power sensor",
+          "fan": "Circulation fan",
+          "fan_speed_number": "Fan speed number entity",
+          "comfort_sensor": "Comfort temperature sensor",
+          "temp_sensor": "Temperature sensor",
+          "humidity_sensor": "Humidity sensor"
+        }
       }
     },
     "abort": {
-      "already_configured": "A zone with this name already exists."
+      "already_configured": "A zone with this name already exists.",
+      "reconfigure_successful": "Devices updated."
     }
   },
   "options": {
