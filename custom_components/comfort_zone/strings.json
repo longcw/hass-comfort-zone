@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Comfort Zone",
+        "description": "Bind the devices this zone controls.",
+        "data": {
+          "name": "Zone name",
+          "comfort_source": "Comfort signal source",
+          "ac_climate": "AC climate entity",
+          "ac_power_switch": "AC reliable power switch (for managed on/off)",
+          "ac_power_sensor": "AC power sensor (leading signal, optional)",
+          "fan": "Circulation fan (optional)",
+          "fan_speed_number": "Fan speed number entity (optional)"
+        }
+      },
+      "signal": {
+        "title": "Comfort signal",
+        "description": "How the regulated comfort temperature is obtained.",
+        "data": {
+          "comfort_sensor": "Comfort temperature sensor",
+          "temp_sensor": "Temperature sensor",
+          "humidity_sensor": "Humidity sensor"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "A zone with this name already exists."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Comfort Zone options",
+        "data": {
+          "strategy": "Strategy",
+          "night_start": "Night start (HH:MM)",
+          "night_end": "Night end (HH:MM)",
+          "comfort_k": "Humidity weight (k)",
+          "comfort_rh_ref": "Reference humidity (%)"
+        }
+      }
+    }
+  }
+}

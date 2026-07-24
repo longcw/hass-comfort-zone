@@ -1,0 +1,172 @@
+"""Scenario tests for the pure control core (no Home Assistant needed).
+
+Run directly:  python tests/test_controller.py
+or with pytest: pytest tests/
+"""
+import os
+import sys
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "custom_components"))
+
+from comfort_zone.controller import Command, Controller, Signals, ZoneParams  # noqa: E402
+from comfort_zone.model import FopdtPredictor, ModelParams  # noqa: E402
+from comfort_zone.safety import SafetyGuard, SafetyParams  # noqa: E402
+from comfort_zone import const  # noqa: E402
+
+BLOWERS = ["低风", "中风", "高风"]
+T0 = datetime(2026, 7, 24, 12, 0, 0)
+
+
+def params(target=26.0, band=0.4):
+    return ZoneParams(
+        target=target,
+        band=band,
+        setpoint_min=24,
+        setpoint_max=27,
+        blower_levels=BLOWERS,
+        fan_min_level=10,
+        fan_max_level=40,
+        managed_off_max_min=30,
+    )
+
+
+def fresh():
+    return Controller(FopdtPredictor(ModelParams()))
+
+
+def sig(t=T0, comfort=26.0, slope=0.0, power=800.0, power_delta=0.0,
+        ac_on=True, setpoint=26, blower_idx=0, fan_on=False, fan_level=None):
+    return Signals(now=t, comfort=comfort, slope=slope, power=power,
+                   power_delta=power_delta, ac_on=ac_on, setpoint=setpoint,
+                   blower_idx=blower_idx, fan_on=fan_on, fan_level=fan_level)
+
+
+def check(cond, msg):
+    if not cond:
+        raise AssertionError(msg)
+
+
+# --- scenarios -------------------------------------------------------------
+
+def test_in_band_is_idle():
+    c = fresh()
+    cmd = c.tick(sig(comfort=26.0, slope=0.0), params())
+    check(cmd.set_setpoint is None, "should not touch setpoint in band")
+    check(cmd.set_ac_power is None, "should not toggle AC in band")
+    check(not cmd.set_fan, f"fan should stay off in band, got {cmd.set_fan}")
+    check(cmd.mode == const.MODE_IDLE, f"expected idle, got {cmd.mode}")
+
+
+def test_mild_warm_uses_fan_first():
+    # within band but above target → the cheap actuator (fan) engages, AC does not
+    c = fresh()
+    cmd = c.tick(sig(comfort=26.25, slope=0.0), params())
+    check(cmd.set_setpoint is None, "mild warmth must not step the AC")
+    check(cmd.set_fan is True, "mild warmth should turn the fan on")
+    check(cmd.mode == const.MODE_FAN_ASSIST, f"expected fan_assist, got {cmd.mode}")
+
+
+def test_warm_ac_off_powers_on():
+    c = fresh()
+    cmd = c.tick(sig(comfort=27.5, ac_on=False, setpoint=26), params())
+    check(cmd.set_ac_power is True, "warm + AC off should power on")
+    check(cmd.set_setpoint == 25, f"cold-start setpoint should be target-1=25, got {cmd.set_setpoint}")
+
+
+def test_engaged_cooling_is_patient_no_churn():
+    """The key anti-churn property: once cooling is engaged and in flight,
+    the controller does NOT keep stepping the setpoint."""
+    c = fresh()
+    p = params()
+    # tick 1: warm, AC on at 26 → step to 25, arm watch
+    cmd = c.tick(sig(t=T0, comfort=27.2, setpoint=26, power=800.0), p)
+    check(cmd.set_setpoint == 25, f"warm should step to 25, got {cmd.set_setpoint}")
+    # tick 2 (+2 min): power jumped (engaged); still warm sensor → must HOLD
+    t2 = T0 + timedelta(minutes=2)
+    cmd = c.tick(sig(t=t2, comfort=27.1, setpoint=25, power=1100.0, power_delta=300.0), p)
+    check(cmd.set_setpoint is None,
+          f"engaged cooling in flight must not re-step, got {cmd.set_setpoint}")
+    check(cmd.mode == const.MODE_COOLING, f"expected cooling/hold, got {cmd.mode}")
+    # tick 3 (+5 min): still engaged, still warm → still HOLD (no stacking)
+    t3 = T0 + timedelta(minutes=5)
+    cmd = c.tick(sig(t=t3, comfort=26.9, setpoint=25, power=1100.0, power_delta=0.0), p)
+    check(cmd.set_setpoint is None, f"still must not stack, got {cmd.set_setpoint}")
+
+
+def test_not_engaged_escalates():
+    """If the AC ignores the command (power flat, slope flat), escalate fast."""
+    c = fresh()
+    p = params()
+    cmd = c.tick(sig(t=T0, comfort=27.2, setpoint=26, power=800.0), p)
+    check(cmd.set_setpoint == 25, "first step to 25")
+    # +5 min, power unchanged, slope flat → not engaged past window(4m) → escalate
+    t2 = T0 + timedelta(minutes=5)
+    cmd = c.tick(sig(t=t2, comfort=27.2, setpoint=25, power=800.0, power_delta=0.0, slope=0.0), p)
+    check(cmd.set_setpoint == 24, f"non-engagement should escalate 25→24, got {cmd.set_setpoint}")
+
+
+def test_cold_eases_fan_first():
+    c = fresh()
+    cmd = c.tick(sig(comfort=25.4, setpoint=25, fan_on=True, fan_level=30), params())
+    check(cmd.set_fan is False, "cold should ease the fan off first")
+    check(cmd.set_setpoint is None, "cold should not raise setpoint while fan still on")
+    check(cmd.mode == const.MODE_EASING, f"expected easing, got {cmd.mode}")
+
+
+def test_overcool_managed_off_and_return():
+    c = fresh()
+    p = params()
+    # deeply cold, at setpoint ceiling, fan already off → managed AC-off
+    cmd = c.tick(sig(t=T0, comfort=25.0, setpoint=27, fan_on=False, slope=-0.05), p)
+    check(cmd.set_ac_power is False, f"overcool at ceiling → managed off, got {cmd.set_ac_power}")
+    check(cmd.mode == const.MODE_MANAGED_OFF, f"expected managed_off, got {cmd.mode}")
+    # later it warms back to target → auto-return powers the AC on
+    t2 = T0 + timedelta(minutes=10)
+    cmd = c.tick(sig(t=t2, comfort=26.05, ac_on=False, setpoint=27, slope=0.03), p)
+    check(cmd.set_ac_power is True, f"should auto-return AC on, got {cmd.set_ac_power}")
+
+
+def test_safety_overheat_overrides():
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
+    opt = Command(mode=const.MODE_IDLE, reason="opt idle")
+    out = g.evaluate(sig(comfort=29.5, setpoint=26), params(), sp, opt)
+    check(out.mode == const.MODE_SAFETY_OVERHEAT, f"expected overheat, got {out.mode}")
+    check(out.set_setpoint == 24, "overheat cools at setpoint floor")
+    check(out.set_ac_power is True and out.set_fan is True, "overheat forces AC+fan on")
+
+
+def test_safety_stale_failsafe():
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
+    opt = Command(mode=const.MODE_COOLING, set_setpoint=24)
+    out = g.evaluate(sig(comfort=26.0), params(), sp, opt, stale=True)
+    check(out.mode == const.MODE_FAILSAFE, f"expected failsafe, got {out.mode}")
+    check(out.set_setpoint == 26, "failsafe parks at a safe fixed setpoint")
+    check(out.set_fan is False, "failsafe stops the fan")
+
+
+def test_safety_normal_passthrough():
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
+    opt = Command(mode=const.MODE_COOLING, set_setpoint=25, reason="opt")
+    out = g.evaluate(sig(comfort=26.0), params(), sp, opt)
+    check(out is opt, "normal conditions must pass the optimizer command through unchanged")
+
+
+ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+
+if __name__ == "__main__":
+    passed = 0
+    for t in ALL:
+        try:
+            t()
+            print(f"  PASS  {t.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"  FAIL  {t.__name__}: {e}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  ERROR {t.__name__}: {type(e).__name__}: {e}")
+    print(f"\n{passed}/{len(ALL)} passed")
+    sys.exit(0 if passed == len(ALL) else 1)

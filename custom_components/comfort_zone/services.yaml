@@ -1,0 +1,23 @@
+identify_model:
+  name: Identify model
+  description: >-
+    Re-fit each comfort zone's control model (power lead, setpoint dead-time,
+    time-constant and gain) from the last 7 days of recorder history.
+
+set_schedule:
+  name: Set schedule
+  description: Persist a zone's 48-point (30-minute) target temperature curve.
+  fields:
+    name:
+      name: Zone name
+      description: Which zone (omit to apply to all zones).
+      required: false
+      example: Master bedroom
+      selector:
+        text:
+    schedule:
+      name: Schedule
+      description: 48 target temperatures (°C), one per 30-minute slot from 00:00.
+      required: true
+      selector:
+        object:

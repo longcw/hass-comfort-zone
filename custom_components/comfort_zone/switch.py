@@ -1,0 +1,36 @@
+"""Enable/disable switch for a comfort zone (gates all actuation)."""
+from __future__ import annotations
+
+from homeassistant.components.switch import SwitchEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import DOMAIN
+from .entity import ComfortZoneEntity
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities([_EnableSwitch(coordinator)])
+
+
+class _EnableSwitch(ComfortZoneEntity, SwitchEntity):
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "enable")
+        self._attr_name = "Enabled"
+        self._attr_icon = "mdi:power"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.enabled
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.set_enabled(True)
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.set_enabled(False)
+        await self.coordinator.async_request_refresh()
