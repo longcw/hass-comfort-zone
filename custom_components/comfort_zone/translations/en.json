@@ -25,8 +25,9 @@
       },
       "reconfigure": {
         "title": "Re-bind devices",
-        "description": "Change the AC, fan, power, or sensors this zone controls (e.g. after swapping a fan).",
+        "description": "Change the AC, fan, power, or the comfort source this zone controls (e.g. swap a fan, or regulate an existing comfort sensor). Fill the comfort sensor OR the temperature + humidity sensors, matching the chosen source.",
         "data": {
+          "comfort_source": "Comfort signal source",
           "ac_climate": "AC climate entity",
           "ac_power_switch": "AC reliable power switch",
           "ac_power_sensor": "AC power sensor",
@@ -37,6 +38,10 @@
           "humidity_sensor": "Humidity sensor"
         }
       }
+    },
+    "error": {
+      "need_comfort_sensor": "Pick a comfort sensor for the 'existing sensor' source.",
+      "need_temp_humidity": "Pick both a temperature and a humidity sensor for the 'compute' source."
     },
     "abort": {
       "already_configured": "A zone with this name already exists.",

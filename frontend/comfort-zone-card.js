@@ -198,10 +198,16 @@
     // the full 0–24h always has a trace and it rolls as the day advances.
     // Throttled to ≤ once / 3 min; cached and redrawn from cache otherwise.
     _maybeFetchActual() {
-      const id = this._ent && this._ent.comfort;
+      // Prefer the backend's real SOURCE sensor (e.g. 婴儿床 舒适温度) — it has
+      // history from before this integration was installed. Fall back to the
+      // integration's own comfort sensor (compute mode).
+      const em = this._st(this._config.zone)?.attributes?.entities || {};
+      const id = em.comfort || (this._ent && this._ent.comfort);
       if (!id || !this._hass || !this._hass.callWS) return;
       const nowMs = Date.now();
-      if (this._actualFetchedAt && nowMs - this._actualFetchedAt < 180000) return;
+      const fresh = this._actualId === id && this._actualFetchedAt && nowMs - this._actualFetchedAt < 180000;
+      if (fresh) return;
+      this._actualId = id;
       this._actualFetchedAt = nowMs; // set first so overlapping updates don't refetch
       const start = new Date(nowMs - 25 * 3600 * 1000);
       this._hass.callWS({
