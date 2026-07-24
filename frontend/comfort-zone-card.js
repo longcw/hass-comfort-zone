@@ -30,7 +30,7 @@
   };
 
   const MODES = {
-    idle: { label: "Idle", color: C.ok },
+    idle: { label: "On target", color: C.ok },
     cooling: { label: "Cooling", color: C.cool },
     easing: { label: "Easing", color: C.teal },
     fan_assist: { label: "Fan assist", color: C.teal },
@@ -86,26 +86,34 @@
       for (const id of sib) {
         const domain = id.split(".")[0];
         const fn = nameOf(id);
-        if (domain === "switch") out.enable = id;
-        else if (domain === "select") out.strategy = id;
+        if (domain === "switch") {
+          if (fn.includes("fan assist")) out.fanAssist = id;
+          else out.enable = id;
+        } else if (domain === "select") out.strategy = id;
         else if (domain === "sensor") {
           if (id === statusId) continue;
           if (fn.includes("comfort")) out.comfort = id;
           else if (fn.includes("predict")) out.predicted = id;
           else if (fn.includes("target")) out.target = id;
         } else if (domain === "number") {
-          if (fn.includes("band")) out.band = id;
+          if (fn.includes("band") && fn.includes("off")) out.bandNoFan = id;
+          else if (fn.includes("band")) out.band = id;
           else if (fn.includes("hard min")) out.hardMin = id;
           else if (fn.includes("hard max")) out.hardMax = id;
+          else if (fn.includes("fan max") && fn.includes("night")) out.fanMaxNight = id;
+          else if (fn.includes("fan max")) out.fanMaxDay = id;
         }
       }
-      // Fallbacks by id substitution.
+      // Fallbacks by id substitution (registry path above is preferred).
       out.comfort ||= `sensor.${slugFull}_comfort_temperature`;
       out.target ||= `sensor.${slugFull}_target`;
       out.predicted ||= `sensor.${slugFull}_predicted_settled`;
       out.enable ||= `switch.${slugFull}_enabled`;
+      out.fanAssist ||= `switch.${slugFull}_fan_assist`;
       out.strategy ||= `select.${slugFull}_strategy`;
-      out.band ||= `number.${slugFull}_band`;
+      out.band ||= `number.${slugFull}_band_fan_on`;
+      out.bandNoFan ||= `number.${slugFull}_band_fan_off`;
+      out.fanMaxDay ||= `number.${slugFull}_fan_max_day`;
 
       // Zone name for the set_schedule service = device/friendly name minus " Status".
       const fn = hass.states[statusId]?.attributes?.friendly_name || slugFull;
@@ -163,6 +171,17 @@
       body.hidden = false;
 
       this._ent = this._resolve();
+
+      // Schedules are per-strategy: when the strategy changes, drop any draft so
+      // we render the new strategy's curve instead of the old one's edits.
+      const strat = status.attributes.strategy;
+      if (this._lastStrategy !== undefined && strat !== this._lastStrategy) {
+        this._draft = null;
+        this._dragging = false;
+        this._markDirty(false);
+      }
+      this._lastStrategy = strat;
+
       this._renderHeader(status);
       this._renderTune(status);
       this._renderHistory(status);
@@ -172,28 +191,57 @@
     // -- header / live state -------------------------------------------------
     _renderHeader(status) {
       const a = status.attributes;
+      const em = a.entities || {};
       const mode = a.enabled === false ? "disabled" : status.state;
       const meta = MODES[mode] || { label: mode, color: C.grey };
       const comfort = fnum(this._st(this._ent.comfort)?.state) ?? a.comfort ?? null;
       const target = fnum(this._st(this._ent.target)?.state) ?? a.target ?? null;
       const band = fnum(a.band) ?? 0.4;
       const onTarget = comfort != null && target != null && Math.abs(comfort - target) <= band;
+      // "idle" already reads "On target"; don't double it up.
+      const pillLabel = mode === "idle" ? meta.label : meta.label + (onTarget ? " · on target" : "");
 
       const pdelta = fnum(a.power_delta);
       const parrow = pdelta == null || Math.abs(pdelta) < 40 ? "" :
         (pdelta > 0 ? `<span class="up">▲</span>` : `<span class="dn">▼</span>`);
       const power = fnum(a.power);
       const slope = fnum(a.slope);
+      const feelEnt = em.comfort || em.temp || this._ent.comfort || this._config.zone;
 
-      const chip = (label, val, extra = "") =>
-        `<div class="chip ${extra}"><span class="k">${label}</span><span class="v">${val}</span></div>`;
+      // chip(): `ent` (optional) makes it open that entity's native HA history.
+      const chip = (label, val, extra = "", ent = null) => {
+        const clickable = ent ? `data-action="more" data-entity="${ent}"` : "";
+        return `<div class="chip ${extra} ${ent ? "clk" : ""}" ${clickable}>
+          <span class="k">${label}</span><span class="v">${val}</span></div>`;
+      };
+
+      // AC state chip — reflects what the AC is ACTUALLY doing, distinct from the
+      // controller mode (the AC keeps cooling on its own while the mode is idle).
+      let acChip;
+      if (a.ac_on) {
+        const st = a.ac_state && a.ac_state !== "cool" ? a.ac_state : "cool";
+        const parts = [st, a.setpoint != null ? `${a.setpoint}°` : "", a.ac_blower || ""].filter(Boolean);
+        acChip = chip("ac", parts.join(" "), "", em.ac);
+      } else {
+        acChip = chip("ac", "off", "soft", em.ac);
+      }
+
+      // Fan chip — reflects the circulation fan's real on/off + assist toggle.
+      let fanChip;
+      if (a.fan_assist_enabled === false) {
+        fanChip = chip("fan", "assist off", "soft", em.fan);
+      } else if (a.fan_on) {
+        fanChip = chip("fan", `${a.fan_level != null ? a.fan_level : "on"}`, "", em.fan);
+      } else {
+        fanChip = chip("fan", "off", "soft", em.fan);
+      }
 
       const enableOn = a.enabled !== false;
       const chips = [
-        a.setpoint != null ? chip("set", `${a.setpoint}°`) : "",
-        a.fan_level != null ? chip("fan", `${a.fan_level}`) : "",
-        power != null ? chip("power", `${(power / 1000).toFixed(power >= 1000 ? 1 : 2)}kW ${parrow}`) : "",
-        slope != null ? chip("slope", `${slope >= 0 ? "+" : ""}${slope.toFixed(2)}`) : "",
+        acChip,
+        fanChip,
+        power != null ? chip("power", `${(power / 1000).toFixed(power >= 1000 ? 1 : 2)}kW ${parrow}`, "", em.power) : "",
+        slope != null ? chip("slope", `${slope >= 0 ? "+" : ""}${slope.toFixed(2)}`, "", feelEnt) : "",
         a.strategy ? chip("strategy", a.strategy) : "",
         a.is_night ? chip("", "☾ night", "soft") : "",
         a.safety_state && a.safety_state !== "normal" ? chip("safety", a.safety_state, "warn") : "",
@@ -207,11 +255,13 @@
                   aria-checked="${enableOn}"><span class="knob"></span></button>
         </div>
         <div class="hero">
-          <span class="feel" style="color:${C.warm}">${comfort != null ? comfort.toFixed(1) : "–"}<span class="deg">°</span></span>
+          <span class="feel clk" style="color:${C.warm}" data-action="more" data-entity="${feelEnt}"
+            >${comfort != null ? comfort.toFixed(1) : "–"}<span class="deg">°</span></span>
           <span class="arrow">→</span>
-          <span class="goal" style="color:${C.cool}">${target != null ? target.toFixed(1) : "–"}<span class="deg">°</span></span>
+          <span class="goal clk" style="color:${C.cool}" data-action="more" data-entity="${em.status || this._config.zone}"
+            >${target != null ? target.toFixed(1) : "–"}<span class="deg">°</span></span>
           <span class="band">±${band.toFixed(1)}</span>
-          <span class="pill" style="--c:${meta.color}">${meta.label}${onTarget ? " · on target" : ""}</span>
+          <span class="pill clk" style="--c:${meta.color}" data-action="more" data-entity="${feelEnt}">${pillLabel}</span>
         </div>
         <div class="reason">${a.reason || ""}</div>
         <div class="chips">${chips}</div>`;
@@ -237,10 +287,22 @@
           </div>`;
       };
 
+      const fanAssistSt = this._st(this._ent.fanAssist);
+      const fanOn = fanAssistSt ? fanAssistSt.state === "on" : true;
+      const fanRow = fanAssistSt ? `
+        <div class="ctl">
+          <span class="sk">fan assist</span>
+          <button class="toggle sm ${fanOn ? "on" : ""}" data-action="fan_assist" role="switch"
+                  aria-checked="${fanOn}" title="${fanOn ? "Fan enabled" : "Fan disabled"}"><span class="knob"></span></button>
+          ${fanOn ? stepper(this._ent.fanMaxDay, "fan max") : ""}
+        </div>` : "";
+
       this.shadowRoot.getElementById("tune").innerHTML = `
         <div class="seg">${seg}</div>
+        ${fanRow}
         <div class="steppers">
-          ${stepper(this._ent.band, "band ±")}
+          ${stepper(this._ent.band, "band · fan on")}
+          ${stepper(this._ent.bandNoFan, "band · fan off")}
           ${stepper(this._ent.hardMin, "hard min")}
           ${stepper(this._ent.hardMax, "hard max")}
         </div>`;
@@ -264,7 +326,7 @@
       // e.t is a UTC ISO timestamp; parse and render in the viewer's local time.
       const d = e.t ? new Date(e.t) : null;
       const t = d && !isNaN(d)
-        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
         : "";
       const acts = (e.actions || []).join(" · ");
       return `<div class="row">
@@ -431,10 +493,21 @@
       if (!el || !this._hass) return;
       const action = el.dataset.action;
       const hass = this._hass;
-      if (action === "toggle") {
+      if (action === "more") {
+        const entityId = el.dataset.entity;
+        if (entityId) {
+          this.dispatchEvent(new CustomEvent("hass-more-info", {
+            detail: { entityId }, bubbles: true, composed: true,
+          }));
+        }
+      } else if (action === "toggle") {
         const st = this._st(this._ent.enable);
         const on = st && st.state === "on";
         hass.callService("switch", on ? "turn_off" : "turn_on", { entity_id: this._ent.enable });
+      } else if (action === "fan_assist") {
+        const st = this._st(this._ent.fanAssist);
+        const on = st && st.state === "on";
+        hass.callService("switch", on ? "turn_off" : "turn_on", { entity_id: this._ent.fanAssist });
       } else if (action === "strategy") {
         hass.callService("select", "select_option", { entity_id: this._ent.strategy, option: el.dataset.val });
       } else if (action === "num") {
@@ -539,15 +612,29 @@
     .striplbl { text-transform:uppercase; letter-spacing:.08em; margin-top:6px; }
     .stream { max-height: 210px; overflow-y:auto; display:flex; flex-direction:column; gap:2px;
       font-family: var(--code-font-family, ui-monospace, SFMono-Regular, Menlo, monospace); }
-    .row { display:grid; grid-template-columns: 42px auto 1fr; grid-template-rows:auto auto; gap:2px 8px;
-      padding:5px 6px; border-radius:6px; }
+    .row { display:grid; grid-template-columns: max-content max-content 1fr; grid-template-rows:auto auto;
+      align-items:baseline; gap:2px 8px; padding:5px 6px; border-radius:6px; }
     .row:nth-child(odd) { background: var(--secondary-background-color); }
-    .t { font-size:11px; color:var(--secondary-text-color); grid-row:1; }
-    .rpill { font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px; justify-self:start;
-      color:var(--c); background: color-mix(in srgb, var(--c) 16%, transparent); grid-row:1; }
-    .racts { font-size:11px; color:var(--primary-text-color); grid-column:3; grid-row:1; text-align:right; }
+    .t { font-size:11px; color:var(--secondary-text-color); grid-row:1; grid-column:1;
+      white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .rpill { font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px; grid-column:2; grid-row:1;
+      white-space:nowrap; color:var(--c); background: color-mix(in srgb, var(--c) 16%, transparent); }
+    .racts { font-size:11px; color:var(--primary-text-color); grid-column:3; grid-row:1; text-align:right;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
     .rreason { font-size:11px; color:var(--secondary-text-color); grid-column:1 / -1; grid-row:2;
       font-family: var(--primary-font-family, sans-serif); }
+
+    /* click-to-history affordances */
+    .clk { cursor:pointer; }
+    .chip.clk:hover { background: color-mix(in srgb, var(--primary-color) 12%, var(--secondary-background-color)); }
+    .feel.clk:hover, .goal.clk:hover, .pill.clk:hover { opacity:.82; }
+
+    /* fan-assist control row */
+    .ctl { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
+    .ctl .sk { font-size:11px; color:var(--secondary-text-color); text-transform:uppercase; letter-spacing:.06em; }
+    .toggle.sm { width:34px; height:20px; }
+    .toggle.sm .knob { width:14px; height:14px; }
+    .toggle.sm.on .knob { left:17px; }
 
     @media (max-width: 420px) { .feel, .goal { font-size:32px; } .racts { display:none; } }
     @media (prefers-reduced-motion: reduce) { .toggle, .toggle .knob { transition:none; } }
