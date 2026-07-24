@@ -10,6 +10,11 @@
 // Config:
 //   type: custom:comfort-zone-card
 //   zone: sensor.master_bedroom_status   # the zone's status sensor
+//   title: 主卧 舒适          # optional; defaults to the zone's name
+//
+// The title renders as a `.card-header`, so section-jump-nav (which scans the
+// shadow tree for a .card-header matching the section target) can jump to it —
+// set its `target` to this title.
 //
 // All related entities (comfort/target/predicted sensors, strategy select,
 // enable switch, tuning numbers) are discovered from the status sensor's device
@@ -307,7 +312,7 @@
 
       this.shadowRoot.getElementById("hd").innerHTML = `
         <div class="hd-top">
-          <div class="zone">${this._ent.zoneName}</div>
+          <div class="zone card-header">${this._config.title || this._ent.zoneName}</div>
           <button class="toggle ${enableOn ? "on" : ""}" data-action="toggle"
                   title="${enableOn ? "Controller on" : "Controller off"}" role="switch"
                   aria-checked="${enableOn}"><span class="knob"></span></button>
