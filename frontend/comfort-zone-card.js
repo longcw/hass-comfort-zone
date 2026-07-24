@@ -11,6 +11,8 @@
 //   type: custom:comfort-zone-card
 //   zone: sensor.master_bedroom_status   # the zone's status sensor
 //   title: 主卧 舒适          # optional; defaults to the zone's name
+//   curve_min: 25            # optional; daily-target chart y-axis range (default 25–27)
+//   curve_max: 27
 //
 // The title renders as a `.card-header`, so section-jump-nav (which scans the
 // shadow tree for a .card-header matching the section target) can jump to it —
@@ -47,7 +49,7 @@
   };
 
   const STRATEGIES = ["baby", "eco", "comfort", "custom"];
-  const T_MIN = 22, T_MAX = 30; // schedule y-axis range (°C)
+  const DEF_TMIN = 25, DEF_TMAX = 27; // default y-axis range (°C); override with curve_min/curve_max
   const SLOTS = 48;             // 30-min slots
 
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -61,6 +63,15 @@
         throw new Error("comfort-zone-card: set `zone:` to the zone's status sensor entity_id");
       }
       this._config = config;
+      // Y-axis range for the daily-target chart. Tight by default (25–27) so the
+      // curve fills the height and 0.1° moves are visible; override per card with
+      // `curve_min:` / `curve_max:`.
+      let tmin = fnum(config.curve_min), tmax = fnum(config.curve_max);
+      if (tmin == null) tmin = DEF_TMIN;
+      if (tmax == null) tmax = DEF_TMAX;
+      if (!(tmax - tmin >= 1)) { tmin = DEF_TMIN; tmax = DEF_TMAX; }  // sane guard
+      this._tmin = clamp(tmin, 10, 34);
+      this._tmax = clamp(tmax, this._tmin + 1, 40);
       this._draft = null;       // local schedule edits (null = follow the entity)
       this._dragging = false;
       this._activeEdit = null;  // {i, t} of the point being dragged/hovered (value badge)
@@ -508,7 +519,7 @@
       const W = 320, H = 160, padL = 26, padR = 8, padT = 10, padB = 20;
       const iw = W - padL - padR, ih = H - padT - padB;
       const X = (i) => padL + (i / (SLOTS - 1)) * iw;
-      const Y = (t) => padT + ((T_MAX - t) / (T_MAX - T_MIN)) * ih;
+      const Y = (t) => padT + ((this._tmax - t) / (this._tmax - this._tmin)) * ih;
       const now = new Date();
       const nowFrac = (now.getHours() * 60 + now.getMinutes()) / 1440;
       const nowX = padL + nowFrac * iw;
@@ -518,8 +529,8 @@
 
       const comfort = fnum(this._st(this._ent.comfort)?.state);
       let line = "", area = `M${X(0)} ${padT + ih} `;
-      data.forEach((t, i) => { line += (i ? "L" : "M") + X(i).toFixed(1) + " " + Y(clamp(t, T_MIN, T_MAX)).toFixed(1) + " "; });
-      data.forEach((t, i) => { area += "L" + X(i).toFixed(1) + " " + Y(clamp(t, T_MIN, T_MAX)).toFixed(1) + " "; });
+      data.forEach((t, i) => { line += (i ? "L" : "M") + X(i).toFixed(1) + " " + Y(clamp(t, this._tmin, this._tmax)).toFixed(1) + " "; });
+      data.forEach((t, i) => { area += "L" + X(i).toFixed(1) + " " + Y(clamp(t, this._tmin, this._tmax)).toFixed(1) + " "; });
       area += `L${X(SLOTS - 1)} ${padT + ih} Z`;
 
       const grid = [0, 6, 12, 18, 24].map((h) => {
@@ -527,21 +538,31 @@
         return `<line x1="${gx}" y1="${padT}" x2="${gx}" y2="${padT + ih}" class="grid"/>
                 <text x="${gx}" y="${H - 5}" class="axl" text-anchor="middle">${h}</text>`;
       }).join("");
-      const yticks = [24, 26, 28].map((t) =>
-        `<text x="${padL - 5}" y="${Y(t) + 3}" class="axl" text-anchor="end">${t}</text>
+      // Y ticks that fit the (configurable) range: whole degrees inside it, or
+      // min/mid/max if the range is narrower than ~2°.
+      const ytickVals = [];
+      for (let t = Math.ceil(this._tmin); t <= Math.floor(this._tmax); t++) ytickVals.push(t);
+      if (ytickVals.length < 2) {
+        const mid = Math.round((this._tmin + this._tmax) * 5) / 10;  // 0.1 precision
+        ytickVals.length = 0;
+        ytickVals.push(this._tmin, mid, this._tmax);
+      }
+      const fmtTick = (t) => (Number.isInteger(t) ? `${t}` : t.toFixed(1));
+      const yticks = ytickVals.map((t) =>
+        `<text x="${padL - 5}" y="${Y(t) + 3}" class="axl" text-anchor="end">${fmtTick(t)}</text>
          <line x1="${padL}" y1="${Y(t)}" x2="${W - padR}" y2="${Y(t)}" class="grid faint"/>`).join("");
 
       const dots = data.map((t, i) =>
-        `<circle cx="${X(i).toFixed(1)}" cy="${Y(clamp(t, T_MIN, T_MAX)).toFixed(1)}" r="2" class="dot"/>`).join("");
+        `<circle cx="${X(i).toFixed(1)}" cy="${Y(clamp(t, this._tmin, this._tmax)).toFixed(1)}" r="2" class="dot"/>`).join("");
 
       const nowDot = comfort != null
-        ? `<circle cx="${nowX.toFixed(1)}" cy="${Y(clamp(comfort, T_MIN, T_MAX)).toFixed(1)}" r="4" fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>`
+        ? `<circle cx="${nowX.toFixed(1)}" cy="${Y(clamp(comfort, this._tmin, this._tmax)).toFixed(1)}" r="4" fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>`
         : "";
 
       // A prominent handle on the SELECTED point (tap-to-select target).
       let selHandle = "";
       if (this._sel != null && data[this._sel] != null) {
-        const sx = X(this._sel), sy = Y(clamp(data[this._sel], T_MIN, T_MAX));
+        const sx = X(this._sel), sy = Y(clamp(data[this._sel], this._tmin, this._tmax));
         selHandle = `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="6"
           fill="var(--card-background-color)" stroke="var(--primary-color)" stroke-width="2.5"/>`;
       }
@@ -554,7 +575,7 @@
       let editBadge = "";
       if (badgeI != null && badgeT != null) {
         const i = badgeI, t = badgeT;
-        const bx = X(i), by = Y(clamp(t, T_MIN, T_MAX));
+        const bx = X(i), by = Y(clamp(t, this._tmin, this._tmax));
         const hh = String(Math.floor(i / 2)).padStart(2, "0");
         const mm = i % 2 ? "30" : "00";
         const bw = 70;
@@ -578,7 +599,7 @@
       const buildPath = (pts) => {
         if (!pts || !pts.length) return "";
         let d = "";
-        pts.forEach((p, i) => { d += (i ? "L" : "M") + XA(p.hf).toFixed(1) + " " + Y(clamp(p.t, T_MIN, T_MAX)).toFixed(1) + " "; });
+        pts.forEach((p, i) => { d += (i ? "L" : "M") + XA(p.hf).toFixed(1) + " " + Y(clamp(p.t, this._tmin, this._tmax)).toFixed(1) + " "; });
         return d.trim();
       };
       const yPath = buildPath((act.yesterday || []).filter((p) => p.hf >= nowHf));
@@ -629,7 +650,7 @@
         const sx = ((ev.clientX - r.left) / r.width) * W;
         const sy = ((ev.clientY - r.top) / r.height) * H;
         const i = clamp(Math.round(((sx - padL) / iw) * (SLOTS - 1)), 0, SLOTS - 1);
-        const t = clamp(snap(T_MAX - ((sy - padT) / ih) * (T_MAX - T_MIN), 0.1), T_MIN, T_MAX);
+        const t = clamp(snap(this._tmax - ((sy - padT) / ih) * (this._tmax - this._tmin), 0.1), this._tmin, this._tmax);
         return { i, t };
       };
       let lastI = null, startX = 0, startY = 0;
@@ -750,7 +771,7 @@
       } else if (action === "sel-adj") {
         if (this._sel == null) return;
         const d = this._draft || this._schedData(this._st(this._config.zone)).slice();
-        d[this._sel] = clamp(snap((+d[this._sel] || 26) + (+el.dataset.d) * 0.1, 0.1), T_MIN, T_MAX);
+        d[this._sel] = clamp(snap((+d[this._sel] || 26) + (+el.dataset.d) * 0.1, 0.1), this._tmin, this._tmax);
         this._draft = d; this._markDirty(true);
         this._renderSchedule(this._st(this._config.zone));
       }
