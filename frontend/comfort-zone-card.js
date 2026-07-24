@@ -324,9 +324,11 @@
           <span class="goal clk" style="color:${C.cool}" data-action="more" data-entity="${em.status || this._config.zone}"
             >${target != null ? target.toFixed(1) : "–"}<span class="deg">°</span></span>
           <span class="band">−${bandLow.toFixed(1)} / +${bandHigh.toFixed(1)}</span>
-          <span class="pill clk" style="--c:${meta.color}" data-action="more" data-entity="${feelEnt}">${pillLabel}</span>
         </div>
-        <div class="reason">${a.reason || ""}</div>
+        <div class="statusline">
+          <span class="pill clk" style="--c:${meta.color}" data-action="more" data-entity="${feelEnt}">${pillLabel}</span>
+          <span class="reason">${a.reason || ""}</span>
+        </div>
         <div class="chips">${chips}</div>`;
     }
 
@@ -649,10 +651,13 @@
     .deg { font-size: 20px; font-weight: 400; }
     .arrow { font-size: 22px; color: var(--secondary-text-color); }
     .band { font-size: 13px; color: var(--secondary-text-color); align-self:center; }
-    .pill { margin-left:auto; align-self:center; font-size:12px; font-weight:600; padding:3px 10px;
+    /* pill + reason share their own line below the numbers, so the pill's text
+       length never reflows the temperature row */
+    .statusline { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:2px 0 8px; }
+    .pill { flex:none; align-self:center; font-size:12px; font-weight:600; padding:3px 10px;
       border-radius:999px; color:var(--c); background: color-mix(in srgb, var(--c) 16%, transparent);
       border:1px solid color-mix(in srgb, var(--c) 40%, transparent); white-space:nowrap; }
-    .reason { font-size: 12.5px; color: var(--secondary-text-color); min-height: 1em; margin-bottom: 8px; }
+    .reason { flex:1; min-width:0; font-size: 12.5px; color: var(--secondary-text-color); }
     .chips { display:flex; flex-wrap:wrap; gap:6px; }
     .chip { display:flex; gap:5px; align-items:baseline; padding:3px 8px; border-radius:7px;
       background: var(--secondary-background-color); font-size:12px; font-variant-numeric: tabular-nums; }
