@@ -65,6 +65,7 @@
       this._dragging = false;
       this._activeEdit = null;  // {i, t} of the point being dragged/hovered (value badge)
       this._hoverI = null;      // last hovered slot index (mouse, non-destructive readout)
+      this._sel = null;         // selected slot index (tap-to-select + stepper editing)
       this._lastSig = null;
       this._actual = null;      // cached actual-comfort trace for today [{hf, t}]
       this._actualFetchedAt = 0;
@@ -326,6 +327,26 @@
         a.safety_state && a.safety_state !== "normal" ? chip("safety", a.safety_state, "warn") : "",
       ].join("");
 
+      // Sensor freshness: when did the regulated source thermometer last report?
+      // (the controller freezes on a stale reading, so surfacing it is useful)
+      const freshEnt = em.comfort || em.temp || this._ent.comfort;
+      let freshHtml = "";
+      const fst = freshEnt ? this._hass.states[freshEnt] : null;
+      if (fst) {
+        const lu = (fst.last_reported && fst.last_reported > fst.last_updated)
+          ? fst.last_reported : fst.last_updated;
+        const d = lu ? new Date(lu) : null;
+        if (d && !isNaN(d)) {
+          const ageS = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+          const ago = ageS < 60 ? "just now"
+            : ageS < 3600 ? `${Math.floor(ageS / 60)}m ago`
+            : `${Math.floor(ageS / 3600)}h ${Math.floor((ageS % 3600) / 60)}m ago`;
+          const hhmmss = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+          const stale = ageS > 20 * 60 ? " stale" : "";
+          freshHtml = `<div class="freshness clk${stale}" data-action="more" data-entity="${freshEnt}">updated ${hhmmss} · ${ago}</div>`;
+        }
+      }
+
       this.shadowRoot.getElementById("hd").innerHTML = `
         <div class="hd-top">
           <div class="zone card-header">${this._config.title || this._ent.zoneName}</div>
@@ -345,6 +366,7 @@
           <span class="pill clk" style="--c:${meta.color}" data-action="more" data-entity="${feelEnt}">${pillLabel}</span>
           <span class="reason">${a.reason || ""}</span>
         </div>
+        ${freshHtml}
         <div class="chips">${chips}</div>`;
     }
 
@@ -483,7 +505,7 @@
 
     _renderSchedule(status) {
       const data = this._schedData(status);
-      const W = 320, H = 132, padL = 26, padR = 8, padT = 8, padB = 18;
+      const W = 320, H = 160, padL = 26, padR = 8, padT = 10, padB = 20;
       const iw = W - padL - padR, ih = H - padT - padB;
       const X = (i) => padL + (i / (SLOTS - 1)) * iw;
       const Y = (t) => padT + ((T_MAX - t) / (T_MAX - T_MIN)) * ih;
@@ -491,6 +513,8 @@
       const nowFrac = (now.getHours() * 60 + now.getMinutes()) / 1440;
       const nowX = padL + nowFrac * iw;
       const nowHf = nowFrac * 24;
+      const nowSlot = clamp(Math.floor((now.getHours() * 60 + now.getMinutes()) / 30), 0, SLOTS - 1);
+      if (this._sel == null) this._sel = nowSlot;   // open on the current time
 
       const comfort = fnum(this._st(this._ent.comfort)?.state);
       let line = "", area = `M${X(0)} ${padT + ih} `;
@@ -514,11 +538,22 @@
         ? `<circle cx="${nowX.toFixed(1)}" cy="${Y(clamp(comfort, T_MIN, T_MAX)).toFixed(1)}" r="4" fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>`
         : "";
 
-      // Value badge on the point currently being dragged: "HH:MM · 26.4°" — so
-      // you read the exact target instead of counting gridlines.
+      // A prominent handle on the SELECTED point (tap-to-select target).
+      let selHandle = "";
+      if (this._sel != null && data[this._sel] != null) {
+        const sx = X(this._sel), sy = Y(clamp(data[this._sel], T_MIN, T_MAX));
+        selHandle = `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="6"
+          fill="var(--card-background-color)" stroke="var(--primary-color)" stroke-width="2.5"/>`;
+      }
+
+      // Value badge "HH:MM · 26.4°" — for the dragged/hovered point if active,
+      // otherwise the selected point (persistent) — so you read the exact target.
+      let badgeI = null, badgeT = null;
+      if (this._activeEdit) { badgeI = this._activeEdit.i; badgeT = this._activeEdit.t; }
+      else if (this._sel != null) { badgeI = this._sel; badgeT = data[this._sel]; }
       let editBadge = "";
-      if (this._activeEdit) {
-        const { i, t } = this._activeEdit;
+      if (badgeI != null && badgeT != null) {
+        const i = badgeI, t = badgeT;
         const bx = X(i), by = Y(clamp(t, T_MIN, T_MAX));
         const hh = String(Math.floor(i / 2)).padStart(2, "0");
         const mm = i % 2 ? "30" : "00";
@@ -567,9 +602,22 @@
           ${dots}
           <line x1="${nowX.toFixed(1)}" y1="${padT}" x2="${nowX.toFixed(1)}" y2="${padT + ih}" class="now"/>
           ${nowDot}
+          ${selHandle}
           ${editBadge}
         </svg>
-        <div class="hint">Drag to shape the day’s target
+        <div class="sched-edit">
+          <div class="se-grp">
+            <button class="se-btn" data-action="sel-move" data-d="-1" aria-label="earlier">‹</button>
+            <span class="se-lab">${String(Math.floor((this._sel ?? 0) / 2)).padStart(2, "0")}:${(this._sel ?? 0) % 2 ? "30" : "00"}</span>
+            <button class="se-btn" data-action="sel-move" data-d="1" aria-label="later">›</button>
+          </div>
+          <div class="se-grp">
+            <button class="se-btn" data-action="sel-adj" data-d="-1" aria-label="cooler">−</button>
+            <span class="se-lab val">${(data[this._sel ?? 0] ?? 26).toFixed(1)}°</span>
+            <button class="se-btn" data-action="sel-adj" data-d="1" aria-label="warmer">+</button>
+          </div>
+        </div>
+        <div class="hint">Tap a point to select · drag to sketch · nudge with the buttons
           <span class="lg"><i class="sw" style="background:var(--primary-color)"></i>target</span>
           <span class="lg"><i class="sw" style="background:${C.warm}"></i>actual today</span>
           <span class="lg"><i class="sw" style="background:${C.warm};opacity:.5;height:1px"></i>yesterday (ahead)</span></div>`;
@@ -584,7 +632,8 @@
         const t = clamp(snap(T_MAX - ((sy - padT) / ih) * (T_MAX - T_MIN), 0.1), T_MIN, T_MAX);
         return { i, t };
       };
-      let lastI = null;
+      let lastI = null, startX = 0, startY = 0;
+      const MOVE_THRESH = 5;   // svg units of movement before a press becomes a sketch
       const paint = (ev) => {
         const { i, t } = evToVal(ev);
         const d = this._draft || this._schedData(status).slice();
@@ -595,27 +644,44 @@
         } else { d[i] = t; }
         lastI = i;
         this._draft = d;
+        this._sel = i;                 // selection follows the sketch
         this._activeEdit = { i, t };   // drives the value badge
         this._markDirty(true);
         this._renderScheduleQuiet(status);
       };
       svg.addEventListener("pointerdown", (ev) => {
-        ev.preventDefault(); this._dragging = true; lastI = null; this._hoverI = null;
-        svg.setPointerCapture(ev.pointerId); paint(ev);
+        ev.preventDefault();
+        const { i } = evToVal(ev);
+        this._sel = i;                 // TAP = select (non-destructive)
+        this._dragging = false; lastI = null; this._hoverI = null;
+        const r = svg.getBoundingClientRect();
+        startX = ((ev.clientX - r.left) / r.width) * W;
+        startY = ((ev.clientY - r.top) / r.height) * H;
+        svg.setPointerCapture(ev.pointerId);
+        this._renderScheduleQuiet(status);   // show the selection immediately
       });
       svg.addEventListener("pointermove", (ev) => {
-        if (this._dragging) { paint(ev); return; }
-        // Hover (mouse only): show the point's EXISTING value — non-destructive.
+        if (ev.buttons) {              // pressed → sketch once it moves past threshold
+          if (!this._dragging) {
+            const r = svg.getBoundingClientRect();
+            const sx = ((ev.clientX - r.left) / r.width) * W;
+            const sy = ((ev.clientY - r.top) / r.height) * H;
+            if (Math.abs(sx - startX) < MOVE_THRESH && Math.abs(sy - startY) < MOVE_THRESH) return;
+            this._dragging = true;
+          }
+          paint(ev);
+          return;
+        }
+        // Hover (mouse only, not pressed): show that point's value — non-destructive.
         const { i } = evToVal(ev);
         if (i === this._hoverI) return;
         this._hoverI = i;
-        const data = this._schedData(status);
-        this._activeEdit = { i, t: data[i] };
+        this._activeEdit = { i, t: this._schedData(status)[i] };
         this._renderScheduleQuiet(status);
       });
       const end = () => {
         this._dragging = false; lastI = null; this._activeEdit = null; this._hoverI = null;
-        this._renderScheduleQuiet(status);  // clear the badge
+        this._renderScheduleQuiet(status);  // keep the selection; clear the transient badge
       };
       svg.addEventListener("pointerup", end);
       svg.addEventListener("pointercancel", end);
@@ -678,6 +744,15 @@
       } else if (action === "revert") {
         this._draft = null; this._markDirty(false);
         this._renderSchedule(this._st(this._config.zone));
+      } else if (action === "sel-move") {
+        this._sel = clamp((this._sel ?? 0) + (+el.dataset.d), 0, SLOTS - 1);
+        this._renderSchedule(this._st(this._config.zone));
+      } else if (action === "sel-adj") {
+        if (this._sel == null) return;
+        const d = this._draft || this._schedData(this._st(this._config.zone)).slice();
+        d[this._sel] = clamp(snap((+d[this._sel] || 26) + (+el.dataset.d) * 0.1, 0.1), T_MIN, T_MAX);
+        this._draft = d; this._markDirty(true);
+        this._renderSchedule(this._st(this._config.zone));
       }
     }
   }
@@ -711,6 +786,10 @@
       border-radius:999px; color:var(--c); background: color-mix(in srgb, var(--c) 16%, transparent);
       border:1px solid color-mix(in srgb, var(--c) 40%, transparent); white-space:nowrap; }
     .reason { flex:1; min-width:0; font-size: 12.5px; color: var(--secondary-text-color); }
+    .freshness { font-size:11px; color: var(--secondary-text-color); opacity:.85; margin:0 0 4px;
+      width:max-content; }
+    .freshness.clk { cursor:pointer; }
+    .freshness.stale { color: ${C.danger}; opacity:1; font-weight:600; }
     .chips { display:flex; flex-wrap:wrap; gap:6px; }
     .chip { display:flex; gap:5px; align-items:baseline; padding:3px 8px; border-radius:7px;
       background: var(--secondary-background-color); font-size:12px; font-variant-numeric: tabular-nums; }
@@ -742,6 +821,16 @@
     .schedsvg .axl { fill: var(--secondary-text-color); font-size:9px; }
     .schedsvg .dot { fill: var(--primary-color); opacity:.5; }
     .schedsvg .now { stroke: ${C.cool}; stroke-width:1.5; stroke-dasharray:3 2; opacity:.8; }
+    .sched-edit { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:8px; }
+    .se-grp { display:flex; align-items:center; gap:4px; flex:1;
+      background:var(--secondary-background-color); border-radius:10px; padding:3px; }
+    .se-btn { flex:none; width:44px; height:40px; border:none; border-radius:8px; cursor:pointer;
+      background:var(--card-background-color); color:var(--primary-text-color);
+      font-size:20px; line-height:1; font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.12); }
+    .se-btn:active { transform:translateY(1px); }
+    .se-lab { flex:1; text-align:center; font-size:15px; font-weight:600; font-variant-numeric:tabular-nums;
+      color:var(--primary-text-color); }
+    .se-lab.val { color:var(--primary-color); }
     .hint { font-size:11px; color: var(--secondary-text-color); margin-top:4px; text-align:center; }
     .hint .lg { margin-left:8px; white-space:nowrap; }
     .hint .sw { display:inline-block; width:9px; height:2px; border-radius:1px; margin-right:3px; vertical-align:middle; }
