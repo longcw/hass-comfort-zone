@@ -261,7 +261,11 @@
 
     _logRow(e) {
       const meta = MODES[e.mode] || { label: e.mode, color: C.grey };
-      const t = (e.t || "").slice(11, 16);
+      // e.t is a UTC ISO timestamp; parse and render in the viewer's local time.
+      const d = e.t ? new Date(e.t) : null;
+      const t = d && !isNaN(d)
+        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : "";
       const acts = (e.actions || []).join(" · ");
       return `<div class="row">
           <span class="t">${t}</span>
