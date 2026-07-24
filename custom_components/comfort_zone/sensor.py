@@ -19,6 +19,7 @@ async def async_setup_entry(
         _TempSensor(coordinator, "comfort", "Comfort temperature"),
         _TempSensor(coordinator, "target", "Target"),
         _TempSensor(coordinator, "predicted", "Predicted settled"),
+        _SlopeSensor(coordinator),
         _StatusSensor(coordinator),
     ])
 
@@ -37,6 +38,24 @@ class _TempSensor(ComfortZoneEntity, SensorEntity):
     def native_value(self):
         v = self._snap.get(self._key)
         return round(v, 2) if isinstance(v, (int, float)) else None
+
+
+class _SlopeSensor(ComfortZoneEntity, SensorEntity):
+    """The regulated signal's rate of change (°C/min) — has its own history."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "°C/min"
+    _attr_suggested_display_precision = 3
+    _attr_icon = "mdi:slope-uphill"
+
+    def __init__(self, coordinator):
+        super().__init__(coordinator, "slope")
+        self._attr_name = "Rate of change"
+
+    @property
+    def native_value(self):
+        v = self._snap.get("slope")
+        return round(v, 3) if isinstance(v, (int, float)) else None
 
 
 class _StatusSensor(ComfortZoneEntity, SensorEntity):

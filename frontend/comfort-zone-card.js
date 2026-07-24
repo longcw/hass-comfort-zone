@@ -101,6 +101,7 @@
           if (id === statusId) continue;
           if (fn.includes("comfort")) out.comfort = id;
           else if (fn.includes("predict")) out.predicted = id;
+          else if (fn.includes("rate") || fn.includes("slope") || fn.includes("变化")) out.slope = id;
           else if (fn.includes("target")) out.target = id;
         } else if (domain === "number") {
           if (fn.includes("band") && fn.includes("low")) out.bandLow = id;
@@ -116,6 +117,7 @@
       out.comfort ||= `sensor.${slugFull}_comfort_temperature`;
       out.target ||= `sensor.${slugFull}_target`;
       out.predicted ||= `sensor.${slugFull}_predicted_settled`;
+      out.slope ||= `sensor.${slugFull}_rate_of_change`;
       out.enable ||= `switch.${slugFull}_enabled`;
       out.fanAssist ||= `switch.${slugFull}_fan_assist`;
       out.strategy ||= `select.${slugFull}_strategy`;
@@ -304,7 +306,7 @@
         acChip,
         fanChip,
         power != null ? chip("power", `${(power / 1000).toFixed(power >= 1000 ? 1 : 2)}kW ${parrow}`, "", em.power) : "",
-        slope != null ? chip("slope", `${slope >= 0 ? "+" : ""}${slope.toFixed(2)}`, "", feelEnt) : "",
+        slope != null ? chip("slope", `${slope >= 0 ? "+" : ""}${slope.toFixed(2)}`, "", this._ent.slope) : "",
         a.strategy ? chip("strategy", a.strategy) : "",
         a.is_night ? chip("", "☾ night", "soft") : "",
         a.safety_state && a.safety_state !== "normal" ? chip("safety", a.safety_state, "warn") : "",
