@@ -63,6 +63,7 @@
       this._config = config;
       this._draft = null;       // local schedule edits (null = follow the entity)
       this._dragging = false;
+      this._activeEdit = null;  // {i, t} of the point being dragged (for the value badge)
       this._lastSig = null;
       this._actual = null;      // cached actual-comfort trace for today [{hf, t}]
       this._actualFetchedAt = 0;
@@ -500,6 +501,24 @@
         ? `<circle cx="${nowX.toFixed(1)}" cy="${Y(clamp(comfort, T_MIN, T_MAX)).toFixed(1)}" r="4" fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>`
         : "";
 
+      // Value badge on the point currently being dragged: "HH:MM · 26.4°" — so
+      // you read the exact target instead of counting gridlines.
+      let editBadge = "";
+      if (this._activeEdit) {
+        const { i, t } = this._activeEdit;
+        const bx = X(i), by = Y(clamp(t, T_MIN, T_MAX));
+        const hh = String(Math.floor(i / 2)).padStart(2, "0");
+        const mm = i % 2 ? "30" : "00";
+        const bw = 70;
+        const tx = clamp(bx, padL + bw / 2, W - padR - bw / 2);
+        const ty = clamp(by - 12, padT + 15, padT + ih);
+        editBadge = `<g text-anchor="middle" style="pointer-events:none">
+            <rect x="${(tx - bw / 2).toFixed(1)}" y="${(ty - 13).toFixed(1)}" width="${bw}" height="16" rx="4" fill="var(--primary-color)"/>
+            <text x="${tx.toFixed(1)}" y="${(ty - 1).toFixed(1)}" font-size="10.5" font-weight="700" fill="var(--text-primary-color, #fff)">${hh}:${mm} · ${t.toFixed(1)}°</text>
+            <circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="4" fill="var(--primary-color)" stroke="var(--card-background-color)" stroke-width="1.5"/>
+          </g>`;
+      }
+
       // Actual comfort on the same axes as the target, mapped by hour-of-day.
       // Each calendar-day bucket is contiguous (hour-of-day only increases within
       // a day) so each is a single clean polyline — no seam handling needed.
@@ -535,6 +554,7 @@
           ${dots}
           <line x1="${nowX.toFixed(1)}" y1="${padT}" x2="${nowX.toFixed(1)}" y2="${padT + ih}" class="now"/>
           ${nowDot}
+          ${editBadge}
         </svg>
         <div class="hint">Drag to shape the day’s target
           <span class="lg"><i class="sw" style="background:var(--primary-color)"></i>target</span>
@@ -548,7 +568,7 @@
         const sx = ((ev.clientX - r.left) / r.width) * W;
         const sy = ((ev.clientY - r.top) / r.height) * H;
         const i = clamp(Math.round(((sx - padL) / iw) * (SLOTS - 1)), 0, SLOTS - 1);
-        const t = clamp(snap(T_MAX - ((sy - padT) / ih) * (T_MAX - T_MIN), 0.5), T_MIN, T_MAX);
+        const t = clamp(snap(T_MAX - ((sy - padT) / ih) * (T_MAX - T_MIN), 0.2), T_MIN, T_MAX);
         return { i, t };
       };
       let lastI = null;
@@ -562,6 +582,7 @@
         } else { d[i] = t; }
         lastI = i;
         this._draft = d;
+        this._activeEdit = { i, t };   // drives the value badge
         this._markDirty(true);
         this._renderScheduleQuiet(status);
       };
@@ -570,7 +591,10 @@
         svg.setPointerCapture(ev.pointerId); paint(ev);
       });
       svg.addEventListener("pointermove", (ev) => { if (this._dragging) paint(ev); });
-      const end = () => { this._dragging = false; lastI = null; };
+      const end = () => {
+        this._dragging = false; lastI = null; this._activeEdit = null;
+        this._renderScheduleQuiet(status);  // clear the badge
+      };
       svg.addEventListener("pointerup", end);
       svg.addEventListener("pointercancel", end);
     }
