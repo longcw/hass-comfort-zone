@@ -60,7 +60,7 @@
       [S]: { entity_id:S, state:"cooling", attributes:{
         friendly_name:"Master bedroom Status", reason:recent_log[recent_log.length-1].reason,
         strategy:"baby", safety_state:"normal", enabled:true, is_night:false,
-        slope:0.03, power:1120, power_delta:180, setpoint:25, fan_level:20, band:0.4,
+        slope:0.03, power:1120, power_delta:180, setpoint:25, fan_level:20, band_low:0.4, band_high:0.7,
         ac_on:true, ac_state:"cool", ac_blower:"中风", fan_on:true, fan_assist_enabled:true,
         entities:entMap, schedule, recent_log } },
       "sensor.master_bedroom_comfort_temperature": {state:"26.1", attributes:{friendly_name:"Master bedroom Comfort temperature"}},
@@ -69,19 +69,21 @@
       "select.master_bedroom_strategy": {state:"baby", attributes:{friendly_name:"Master bedroom Strategy"}},
       "switch.master_bedroom_enabled": {state:"on", attributes:{friendly_name:"Master bedroom Enabled"}},
       "switch.master_bedroom_fan_assist": {state:"on", attributes:{friendly_name:"Master bedroom Fan assist"}},
-      "number.master_bedroom_band_fan_on": {state:"0.4", attributes:{friendly_name:"Master bedroom Band (fan on)", unit_of_measurement:"°C", step:0.05, min:0.2, max:1.5}},
-      "number.master_bedroom_band_fan_off": {state:"0.3", attributes:{friendly_name:"Master bedroom Band (fan off)", unit_of_measurement:"°C", step:0.05, min:0.2, max:1.5}},
+      "number.master_bedroom_band_low": {state:"0.4", attributes:{friendly_name:"Master bedroom Band low (cold side)", unit_of_measurement:"°C", step:0.05, min:0.1, max:1.5}},
+      "number.master_bedroom_band_high": {state:"0.7", attributes:{friendly_name:"Master bedroom Band high (fan on)", unit_of_measurement:"°C", step:0.05, min:0.1, max:1.5}},
+      "number.master_bedroom_band_high_no_fan": {state:"0.4", attributes:{friendly_name:"Master bedroom Band high (fan off)", unit_of_measurement:"°C", step:0.05, min:0.1, max:1.5}},
       "number.master_bedroom_fan_max_day": {state:"40", attributes:{friendly_name:"Master bedroom Fan max (day)", unit_of_measurement:"%", step:5, min:10, max:100}},
       "number.master_bedroom_hard_min_safety": {state:"23", attributes:{friendly_name:"Master bedroom Hard min (safety)", unit_of_measurement:"°C", step:0.5, min:20, max:26}},
       "number.master_bedroom_hard_max_safety": {state:"29", attributes:{friendly_name:"Master bedroom Hard max (safety)", unit_of_measurement:"°C", step:0.5, min:27, max:32}},
     };
     const entities = {}; Object.keys(states).forEach(id=>entities[id]={entity_id:id, device_id:"dev1"});
-    // Mock a rolling ~25h comfort trace (spans both sides of the now-marker).
+    // Mock a ~48h comfort trace so BOTH calendar-day buckets populate: today
+    // (solid, 00:00→now) and yesterday (dotted, full day).
     function genTrace(){
       const pts=[]; const now=Date.now();
-      for (let m=25*60; m>=0; m-=15) {
+      for (let m=48*60; m>=0; m-=15) {
         const ts = now - m*60000;
-        const h = (25*60 - m)/60;
+        const h = (48*60 - m)/60;
         const temp = 26.2 + 0.8*Math.sin(h/3.4) + 0.25*Math.sin(h/0.9);
         pts.push({ s: temp.toFixed(2), lu: Math.floor(ts/1000) });
       }

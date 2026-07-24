@@ -98,8 +98,9 @@
           else if (fn.includes("predict")) out.predicted = id;
           else if (fn.includes("target")) out.target = id;
         } else if (domain === "number") {
-          if (fn.includes("band") && fn.includes("off")) out.bandNoFan = id;
-          else if (fn.includes("band")) out.band = id;
+          if (fn.includes("band") && fn.includes("low")) out.bandLow = id;
+          else if (fn.includes("band") && fn.includes("off")) out.bandHighNoFan = id;
+          else if (fn.includes("band") && fn.includes("high")) out.bandHigh = id;
           else if (fn.includes("hard min")) out.hardMin = id;
           else if (fn.includes("hard max")) out.hardMax = id;
           else if (fn.includes("fan max") && fn.includes("night")) out.fanMaxNight = id;
@@ -113,8 +114,9 @@
       out.enable ||= `switch.${slugFull}_enabled`;
       out.fanAssist ||= `switch.${slugFull}_fan_assist`;
       out.strategy ||= `select.${slugFull}_strategy`;
-      out.band ||= `number.${slugFull}_band_fan_on`;
-      out.bandNoFan ||= `number.${slugFull}_band_fan_off`;
+      out.bandLow ||= `number.${slugFull}_band_low`;
+      out.bandHigh ||= `number.${slugFull}_band_high`;
+      out.bandHighNoFan ||= `number.${slugFull}_band_high_no_fan`;
       out.fanMaxDay ||= `number.${slugFull}_fan_max_day`;
 
       // Zone name for the set_schedule service = device/friendly name minus " Status".
@@ -191,11 +193,12 @@
       this._maybeFetchActual();
     }
 
-    // -- actual comfort trace (rolling 24h) ----------------------------------
-    // Fetch a trailing ~25h of the room's real comfort so it can be overlaid on
-    // the target curve, plotted by LOCAL hour-of-day: hours left of the now-marker
-    // are today's actual, hours to the right are yesterday's for those hours — so
-    // the full 0–24h always has a trace and it rolls as the day advances.
+    // -- actual comfort trace (today solid, yesterday dotted) ----------------
+    // Fetch a trailing ~48h of the room's real comfort and bucket it by LOCAL
+    // CALENDAR DAY: today's actual is drawn SOLID (00:00 → now), the previous
+    // day's DOTTED as a full-width reference. Plotted by hour-of-day on the same
+    // axes as the target so the two compare directly while shaping the curve.
+    // As today advances its solid line extends over yesterday's dotted one.
     // Throttled to ≤ once / 3 min; cached and redrawn from cache otherwise.
     _maybeFetchActual() {
       // Prefer the backend's real SOURCE sensor (e.g. 婴儿床 舒适温度) — it has
@@ -209,7 +212,7 @@
       if (fresh) return;
       this._actualId = id;
       this._actualFetchedAt = nowMs; // set first so overlapping updates don't refetch
-      const start = new Date(nowMs - 25 * 3600 * 1000);
+      const start = new Date(nowMs - 48 * 3600 * 1000);
       this._hass.callWS({
         type: "history/history_during_period",
         start_time: start.toISOString(),
@@ -219,16 +222,23 @@
         no_attributes: true,
       }).then((res) => {
         const arr = (res && res[id]) || [];
-        const pts = [];
+        const mid = new Date(); mid.setHours(0, 0, 0, 0);
+        const midToday = mid.getTime();
+        const midYest = midToday - 24 * 3600 * 1000;
+        const today = [], yesterday = [];
         for (const p of arr) {
           const v = fnum(p.s);
           const lu = p.lu != null ? p.lu : p.last_updated;
           if (v == null || lu == null) continue;
-          const d = new Date(lu * 1000);
-          pts.push({ lu, hf: d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600, t: v });
+          const ms = lu * 1000;
+          const d = new Date(ms);
+          const pt = { ms, hf: d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600, t: v };
+          if (ms >= midToday) today.push(pt);
+          else if (ms >= midYest) yesterday.push(pt);
         }
-        pts.sort((a, b) => a.lu - b.lu); // TIME order — seam handled at render
-        this._actual = pts;
+        today.sort((a, b) => a.ms - b.ms);
+        yesterday.sort((a, b) => a.ms - b.ms);
+        this._actual = { today, yesterday };
         const status = this._st(this._config.zone);
         if (status && !this._dragging) this._renderSchedule(status);
       }).catch(() => { /* no history → just skip the overlay */ });
@@ -242,8 +252,10 @@
       const meta = MODES[mode] || { label: mode, color: C.grey };
       const comfort = fnum(this._st(this._ent.comfort)?.state) ?? a.comfort ?? null;
       const target = fnum(this._st(this._ent.target)?.state) ?? a.target ?? null;
-      const band = fnum(a.band) ?? 0.4;
-      const onTarget = comfort != null && target != null && Math.abs(comfort - target) <= band;
+      const bandLow = fnum(a.band_low) ?? 0.4;
+      const bandHigh = fnum(a.band_high) ?? bandLow;
+      const onTarget = comfort != null && target != null
+        && comfort >= target - bandLow && comfort <= target + bandHigh;
       // "idle" already reads "On target"; don't double it up.
       const pillLabel = mode === "idle" ? meta.label : meta.label + (onTarget ? " · on target" : "");
 
@@ -306,7 +318,7 @@
           <span class="arrow">→</span>
           <span class="goal clk" style="color:${C.cool}" data-action="more" data-entity="${em.status || this._config.zone}"
             >${target != null ? target.toFixed(1) : "–"}<span class="deg">°</span></span>
-          <span class="band">±${band.toFixed(1)}</span>
+          <span class="band">−${bandLow.toFixed(1)} / +${bandHigh.toFixed(1)}</span>
           <span class="pill clk" style="--c:${meta.color}" data-action="more" data-entity="${feelEnt}">${pillLabel}</span>
         </div>
         <div class="reason">${a.reason || ""}</div>
@@ -347,8 +359,9 @@
         <div class="seg">${seg}</div>
         ${fanRow}
         <div class="steppers">
-          ${stepper(this._ent.band, "band · fan on")}
-          ${stepper(this._ent.bandNoFan, "band · fan off")}
+          ${stepper(this._ent.bandLow, "band low")}
+          ${stepper(this._ent.bandHigh, "band high (fan)")}
+          ${stepper(this._ent.bandHighNoFan, "band high (no fan)")}
           ${stepper(this._ent.hardMin, "hard min")}
           ${stepper(this._ent.hardMax, "hard max")}
         </div>`;
@@ -469,23 +482,23 @@
         ? `<circle cx="${nowX.toFixed(1)}" cy="${Y(clamp(comfort, T_MIN, T_MAX)).toFixed(1)}" r="4" fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>`
         : "";
 
-      // Actual comfort trace for today (00:00 → now), on the same axes as the
-      // target so the two can be compared while shaping the curve. Mapped on the
-      // /24 hour scale so it ends exactly at the now-marker.
+      // Actual comfort on the same axes as the target, mapped by hour-of-day.
+      // Each calendar-day bucket is contiguous (hour-of-day only increases within
+      // a day) so each is a single clean polyline — no seam handling needed.
+      // Today = SOLID (00:00 → now); yesterday = DOTTED full-width reference.
       const XA = (hf) => padL + (clamp(hf, 0, 24) / 24) * iw;
-      const apts = this._actual || [];
+      const act = this._actual || { today: [], yesterday: [] };
+      const buildPath = (pts) => {
+        if (!pts || !pts.length) return "";
+        let d = "";
+        pts.forEach((p, i) => { d += (i ? "L" : "M") + XA(p.hf).toFixed(1) + " " + Y(clamp(p.t, T_MIN, T_MAX)).toFixed(1) + " "; });
+        return d.trim();
+      };
+      const yPath = buildPath(act.yesterday);
+      const tPath = buildPath(act.today);
       let actualLine = "";
-      if (apts.length) {
-        // Walk in time order; start a new segment whenever hour-of-day drops
-        // (midnight crossing) so there's no false vertical line at the seam.
-        let prevHf = null, dpath = "";
-        for (const p of apts) {
-          const cmd = (prevHf == null || p.hf < prevHf) ? "M" : "L";
-          dpath += cmd + XA(p.hf).toFixed(1) + " " + Y(clamp(p.t, T_MIN, T_MAX)).toFixed(1) + " ";
-          prevHf = p.hf;
-        }
-        actualLine = `<path d="${dpath}" fill="none" stroke="${C.warm}" stroke-width="1.5" stroke-opacity="0.7" stroke-linejoin="round" stroke-linecap="round"/>`;
-      }
+      if (yPath) actualLine += `<path d="${yPath}" fill="none" stroke="${C.warm}" stroke-width="1" stroke-opacity="0.5" stroke-dasharray="2 3" stroke-linejoin="round" stroke-linecap="round"/>`;
+      if (tPath) actualLine += `<path d="${tPath}" fill="none" stroke="${C.warm}" stroke-width="1.5" stroke-opacity="0.9" stroke-linejoin="round" stroke-linecap="round"/>`;
 
       this.shadowRoot.getElementById("sched").innerHTML = `
         <svg id="sched-svg" viewBox="0 0 ${W} ${H}" class="schedsvg" touch-action="none">
@@ -505,7 +518,8 @@
         </svg>
         <div class="hint">Drag to shape the day’s target
           <span class="lg"><i class="sw" style="background:var(--primary-color)"></i>target</span>
-          <span class="lg"><i class="sw" style="background:${C.warm}"></i>actual feel</span></div>`;
+          <span class="lg"><i class="sw" style="background:${C.warm}"></i>actual today</span>
+          <span class="lg"><i class="sw dot" style="border-top:1px dotted ${C.warm};background:none"></i>yesterday</span></div>`;
 
       const svg = this.shadowRoot.getElementById("sched-svg");
       const geo = { W, H, padL, padR, padT, padB, iw, ih, X, Y };
