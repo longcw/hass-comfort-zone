@@ -363,18 +363,20 @@
           <span class="sk">fan assist</span>
           <button class="toggle sm ${fanOn ? "on" : ""}" data-action="fan_assist" role="switch"
                   aria-checked="${fanOn}" title="${fanOn ? "Fan enabled" : "Fan disabled"}"><span class="knob"></span></button>
-          ${fanOn ? stepper(this._ent.fanMaxDay, "fan max") : ""}
         </div>` : "";
+
+      // Only the everyday knobs live on the card; fan-max / hard limits / the
+      // inactive band variant stay on the device page. "band high" targets
+      // whichever high band is in effect now (fan-on vs fan-off) so it always
+      // matches the −low/+high shown in the header.
+      const bandHighEnt = fanOn ? this._ent.bandHigh : this._ent.bandHighNoFan;
 
       this.shadowRoot.getElementById("tune").innerHTML = `
         <div class="seg">${seg}</div>
         ${fanRow}
         <div class="steppers">
           ${stepper(this._ent.bandLow, "band low", true)}
-          ${stepper(this._ent.bandHigh, "band high (fan)")}
-          ${stepper(this._ent.bandHighNoFan, "band high (no fan)")}
-          ${stepper(this._ent.hardMin, "hard min")}
-          ${stepper(this._ent.hardMax, "hard max")}
+          ${stepper(bandHighEnt, "band high")}
         </div>`;
     }
 
