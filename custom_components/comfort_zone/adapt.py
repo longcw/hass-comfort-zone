@@ -24,12 +24,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from .const import LEAD_CAP
 from .model import ModelParams
 
 ALPHA = 0.3                 # EMA weight on the newest observation (fast)
 GAIN_MIN, GAIN_MAX = 0.1, 2.0
 DEAD_MIN, DEAD_MAX = 2.0, 25.0
 SLOPE_EPS = 0.02
+
+# Anticipation-lead learning: keep the worst band overshoot within tolerance.
+OVERSHOOT_TOL = 0.15        # °C of overshoot beyond the band we'll tolerate
+LEAD_UP = 1.0              # minutes added per over-tolerance excursion (×severity)
+LEAD_DOWN = 0.4           # minutes relaxed per within-tolerance excursion (anti-cycle)
 
 
 @dataclass
@@ -44,6 +50,8 @@ class OnlineAdapter:
     def __init__(self, params: ModelParams) -> None:
         self.params = params
         self._ep: _Episode | None = None
+        self._exc_side: str | None = None   # current band excursion: 'warm'/'cold'
+        self._exc_peak: float = 0.0          # worst overshoot (°C) in this excursion
 
     def on_setpoint_command(self, now: datetime, delta_c: float, comfort: float | None) -> None:
         if comfort is None:
@@ -61,8 +69,48 @@ class OnlineAdapter:
         """AC cut / mode change / managed-off — the episode is no longer clean."""
         self._ep = None
 
-    def observe(self, now: datetime, comfort: float | None, slope: float | None) -> bool:
-        """Advance the active episode. Returns True if model params changed."""
+    def observe(self, now, comfort, slope, target=None, band_low=None, band_high=None) -> bool:
+        """Advance learning one tick. Returns True if any model param changed."""
+        changed = False
+        if comfort is not None and target is not None and band_low is not None and band_high is not None:
+            changed = self._track_excursion(comfort, target, band_low, band_high) or changed
+        return self._advance_episode(now, comfort, slope) or changed
+
+    def _track_excursion(self, comfort, target, band_low, band_high) -> bool:
+        """Learn the anticipation lead from how far comfort overshoots the band.
+
+        Every excursion beyond the band is scored: overshoot beyond tolerance →
+        anticipate earlier (lead up, ∝ severity); overshoot within tolerance →
+        relax (lead down) so we don't anticipate more than needed (which would
+        add cycling). Converges to the least anticipation that keeps overshoot
+        in check — the overshoot⇄cycling balance, and it tracks a drifting
+        dead-time because recent excursions drive it.
+        """
+        hi, lo = target + band_high, target - band_low
+        if comfort > hi:
+            if self._exc_side != "warm":
+                self._exc_side, self._exc_peak = "warm", 0.0
+            self._exc_peak = max(self._exc_peak, comfort - hi)
+            return False
+        if comfort < lo:
+            if self._exc_side != "cold":
+                self._exc_side, self._exc_peak = "cold", 0.0
+            self._exc_peak = max(self._exc_peak, lo - comfort)
+            return False
+        # back in band → close out the excursion and adjust the lead
+        if self._exc_side is None:
+            return False
+        peak, self._exc_side, self._exc_peak = self._exc_peak, None, 0.0
+        old = self.params.lead_min
+        if peak > OVERSHOOT_TOL:
+            self.params.lead_min = min(LEAD_CAP, old + LEAD_UP * min(2.0, peak / OVERSHOOT_TOL))
+        else:
+            self.params.lead_min = max(0.0, old - LEAD_DOWN)
+        self.params.lead_min = round(self.params.lead_min, 2)
+        return self.params.lead_min != old
+
+    def _advance_episode(self, now: datetime, comfort: float | None, slope: float | None) -> bool:
+        """Advance the active cooling episode (gain / dead-time). True if changed."""
         ep = self._ep
         if ep is None or comfort is None:
             return False

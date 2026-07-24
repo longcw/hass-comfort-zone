@@ -73,6 +73,9 @@ MK_GAIN: Final = "gain_per_step"                   # °C settled change per 1°C
 MK_POWER_LEAD: Final = "power_lead_min"            # power leads comfort slope by this
 MK_ENGAGE_WATTS: Final = "engage_watts"            # Δpower that counts as "engaged"
 MK_ENGAGE_WINDOW: Final = "engage_window_min"      # how long to wait for engagement
+MK_LEAD: Final = "lead_min"                        # anticipation lead (LEARNED, bounded)
+
+LEAD_CAP: Final = 8.0          # max anticipation lead the learner may reach (min)
 
 MODEL_DEFAULTS: Final = {
     MK_DEAD_TIME: 10.0,
@@ -81,6 +84,7 @@ MODEL_DEFAULTS: Final = {
     MK_POWER_LEAD: 6.0,
     MK_ENGAGE_WATTS: 150.0,
     MK_ENGAGE_WINDOW: 4.0,
+    MK_LEAD: 3.0,           # start with a little anticipation; the adapter tunes it
 }
 
 # ---------------------------------------------------------------------------

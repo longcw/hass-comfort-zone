@@ -38,8 +38,10 @@ from .const import (
     MODE_IDLE,
     MODE_MANAGED_OFF,
 )
+from .const import LEAD_CAP
 from .model import FopdtPredictor
 
+ANTICIP_CAP = 0.6         # °C — max shift the anticipation lead may apply
 SLOPE_EPS = 0.02          # °C/min considered "flat"
 FAN_HYST = 0.1            # °C hysteresis around target for fan on/off
 FAN_SPAN = 2.0           # °C above target at which the fan reaches its cap
@@ -173,6 +175,10 @@ class Controller:
 
         settled = self.predictor.predict_settled(s.now, y)
         trend = self.predictor.predict_trend(y, s.slope, m.power_lead_min)
+        # Anticipation: act on where the signal is HEADING, by a learned (bounded)
+        # lead. y_ahead crosses the band before y does, so we start/ease earlier.
+        lead = max(0.0, min(LEAD_CAP, m.lead_min))
+        y_ahead = y + max(-ANTICIP_CAP, min(ANTICIP_CAP, slope * lead))
         cooling_incoming = s.power_delta is not None and s.power_delta > m.engage_watts
         warming_incoming = s.power_delta is not None and s.power_delta < -m.engage_watts
         mins = self._mins_since_cmd(s.now)
@@ -197,7 +203,7 @@ class Controller:
             return cmd
 
         # === 2. WARM ========================================================
-        if settled > hi or y > hi:
+        if settled > hi or y > hi or y_ahead > hi:
             recent_cool = self._last_cmd_cooling and mins <= (m.dead_time_min + m.tau_min)
             not_engaged = recent_cool and not engaged
 
@@ -215,7 +221,7 @@ class Controller:
                 dp = (s.power - self._power_at_cmd) if (s.power is not None and self._power_at_cmd is not None) else 0
                 cmd.mode = MODE_COOLING
                 cmd.reason = f"not engaged after {mins:.0f}m (Δpower {dp:+.0f}W, flat slope) → escalate to {cmd.set_setpoint}"
-            elif settled <= hi:
+            elif settled <= hi and self.predictor.has_pending_cooling(s.now):
                 cmd.mode = MODE_COOLING
                 cmd.reason = (f"warm ({y:.2f}) but cooling in flight "
                               f"({self.predictor.remaining_effect(s.now):+.2f}°C) → hold")
@@ -231,7 +237,7 @@ class Controller:
                 cmd.reason = f"warm ({y:.2f}) at setpoint floor → holding (blower/fan carry)"
 
         # === 3. COLD ========================================================
-        elif settled < lo or y < lo:
+        elif settled < lo or y < lo or y_ahead < lo:
             if rising:
                 cmd.mode = MODE_EASING
                 cmd.reason = f"cold ({y:.2f}) but rising ({slope:+.3f}) → warming back, hold"
@@ -253,8 +259,22 @@ class Controller:
 
         # === 4. In band ====================================================
         else:
-            cmd.mode = MODE_IDLE
-            cmd.reason = f"on target ({y:.2f} in [{lo:.2f},{hi:.2f}])"
+            # Return-to-neutral: below target and still falling on a low (cooling)
+            # setpoint → ease the setpoint up now instead of sitting parked on a
+            # cooling setpoint and slowly drifting into an overcool.
+            if (y <= p.target and falling and s.ac_on and s.setpoint is not None
+                    and s.setpoint < p.setpoint_max and mins >= self._step_dwell()):
+                self._command_setpoint(cmd, s, s.setpoint + 1)
+                cmd.mode = MODE_EASING
+                cmd.reason = f"in-band below target & falling → setpoint {cmd.set_setpoint} (return to neutral)"
+            else:
+                cmd.mode = MODE_IDLE
+                cmd.reason = f"on target ({y:.2f} in [{lo:.2f},{hi:.2f}])"
+
+        # note when the trigger was the anticipation lead, not the reading itself
+        if lo <= y <= hi and lo <= settled <= hi and (y_ahead > hi or y_ahead < lo) \
+                and cmd.mode in (MODE_COOLING, MODE_EASING):
+            cmd.reason = f"anticipating ({y_ahead:.2f}) — {cmd.reason}"
 
         # === 5. AC blower + fan comfort layer ==============================
         self._manage_blower(cmd, s, p, y, hi, falling)

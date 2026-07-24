@@ -308,7 +308,7 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
                 self._adapter.on_setpoint_command(now, cmd.set_setpoint - signals.setpoint, comfort)
         else:
             self._adapter.cancel()
-        if self._adapter.observe(now, comfort, slope):
+        if self._adapter.observe(now, comfort, slope, target, band_low, band_high):
             await self.store.set_model(self._predictor.params.to_dict())
             _LOGGER.info("%s: adapted model → %s", self.zone_name, self._predictor.params.to_dict())
 

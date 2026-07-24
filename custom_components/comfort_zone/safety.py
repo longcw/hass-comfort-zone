@@ -138,9 +138,15 @@ class SafetyGuard:
 
     def _overheat_cmd(self, s: Signals, p: ZoneParams, y: float, sp: SafetyParams) -> Command:
         top_blower = len(p.blower_levels) - 1 if p.blower_levels else None
+        release = sp.hard_max - RELEASE_HYST
+        reason = (
+            f"OVERHEAT guard: comfort {y:.2f} > hard_max {sp.hard_max:.1f} → full cool"
+            if y > sp.hard_max
+            else f"OVERHEAT guard: full cool, holding until comfort ≤ {release:.1f} (now {y:.2f})"
+        )
         return Command(
             mode=MODE_SAFETY_OVERHEAT,
-            reason=f"OVERHEAT guard: comfort {y:.2f} > hard_max {sp.hard_max:.1f} → full cool",
+            reason=reason,
             set_ac_power=True,
             set_setpoint=p.setpoint_min,
             set_blower_idx=top_blower,
@@ -149,9 +155,15 @@ class SafetyGuard:
         )
 
     def _overcool_cmd(self, s: Signals, y: float, sp: SafetyParams) -> Command:
+        release = sp.hard_min + RELEASE_HYST
+        reason = (
+            f"OVERCOOL guard: comfort {y:.2f} < hard_min {sp.hard_min:.1f} → AC off"
+            if y < sp.hard_min
+            else f"OVERCOOL guard: AC off, holding until comfort ≥ {release:.1f} (now {y:.2f})"
+        )
         return Command(
             mode=MODE_SAFETY_OVERCOOL,
-            reason=f"OVERCOOL guard: comfort {y:.2f} < hard_min {sp.hard_min:.1f} → AC off",
+            reason=reason,
             set_ac_power=False,
             set_fan=False,
         )

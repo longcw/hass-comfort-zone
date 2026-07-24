@@ -33,6 +33,7 @@ from .const import (
     MK_ENGAGE_WATTS,
     MK_ENGAGE_WINDOW,
     MK_GAIN,
+    MK_LEAD,
     MK_POWER_LEAD,
     MK_TAU,
     MODEL_DEFAULTS,
@@ -47,6 +48,7 @@ class ModelParams:
     power_lead_min: float = MODEL_DEFAULTS[MK_POWER_LEAD]
     engage_watts: float = MODEL_DEFAULTS[MK_ENGAGE_WATTS]
     engage_window_min: float = MODEL_DEFAULTS[MK_ENGAGE_WINDOW]
+    lead_min: float = MODEL_DEFAULTS[MK_LEAD]
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "ModelParams":
@@ -60,6 +62,7 @@ class ModelParams:
             power_lead_min=float(d[MK_POWER_LEAD]),
             engage_watts=float(d[MK_ENGAGE_WATTS]),
             engage_window_min=float(d[MK_ENGAGE_WINDOW]),
+            lead_min=float(d[MK_LEAD]),
         )
 
     def to_dict(self) -> dict:
@@ -70,6 +73,7 @@ class ModelParams:
             MK_POWER_LEAD: self.power_lead_min,
             MK_ENGAGE_WATTS: self.engage_watts,
             MK_ENGAGE_WINDOW: self.engage_window_min,
+            MK_LEAD: self.lead_min,
         }
 
 

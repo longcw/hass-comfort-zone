@@ -220,6 +220,41 @@ def test_safety_normal_passthrough():
     check(out is opt, "normal conditions must pass the optimizer command through unchanged")
 
 
+def test_anticipation_pre_cools():
+    # in-band (26.2) but rising; with the default lead the forecast crosses the
+    # band top → start cooling early instead of waiting for the overshoot
+    c = fresh()
+    cmd = c.tick(sig(comfort=26.2, slope=0.1, setpoint=26), params())
+    check(cmd.set_setpoint == 25, f"anticipated warm should pre-cool to 25, got {cmd.set_setpoint}")
+
+
+def test_in_band_return_to_neutral():
+    # below target, still falling, setpoint parked low (24) → ease it back up
+    # instead of sitting on a cooling setpoint and drifting into an overcool
+    c = fresh()
+    cmd = c.tick(sig(comfort=25.8, slope=-0.03, setpoint=24), params(target=26.0))
+    check(cmd.set_setpoint == 25, f"return-to-neutral should raise setpoint to 25, got {cmd.set_setpoint}")
+    check(cmd.mode == const.MODE_EASING, f"expected easing, got {cmd.mode}")
+
+
+def test_adapter_learns_lead_from_overshoot():
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    m = ModelParams()
+    a = OnlineAdapter(m)
+    kw = dict(target=26.0, band_low=0.4, band_high=0.4)  # band top 26.4
+    # a big overshoot (peaks 0.6 over the band) then recovers → lead increases
+    a.observe(T0, 27.0, 0.0, **kw)
+    before = m.lead_min
+    a.observe(T0 + timedelta(minutes=2), 26.0, 0.0, **kw)
+    check(m.lead_min > before, f"overshoot should raise lead, {before}→{m.lead_min}")
+    # a tiny overshoot (0.1 < tolerance) then recovers → lead relaxes (anti-cycle)
+    mid = m.lead_min
+    a.observe(T0 + timedelta(minutes=4), 26.5, 0.0, **kw)
+    a.observe(T0 + timedelta(minutes=6), 26.0, 0.0, **kw)
+    check(m.lead_min < mid, f"within-tolerance excursion should relax lead, {mid}→{m.lead_min}")
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
