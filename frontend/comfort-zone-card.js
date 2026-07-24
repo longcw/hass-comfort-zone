@@ -332,16 +332,22 @@
         `<button class="segbtn ${s === cur ? "sel" : ""}" data-action="strategy" data-val="${s}">${s}</button>`
       ).join("");
 
-      const stepper = (id, label) => {
+      // `signed` renders a below-target offset as a negative value with the
+      // buttons matching temperature direction: "+" warms the floor (toward
+      // target → smaller magnitude), "–" cools it (further below → larger).
+      const stepper = (id, label, signed = false) => {
         const st = this._st(id);
         if (!st) return "";
         const v = fnum(st.state);
         const unit = st.attributes.unit_of_measurement || "";
+        const disp = v == null ? "–" : (signed ? `−${Math.abs(v).toFixed(2)}` : v);
+        const lDir = signed ? 1 : -1;   // left "–"
+        const rDir = signed ? -1 : 1;   // right "+"
         return `<div class="stepper">
             <span class="sk">${label}</span>
-            <button class="sb" data-action="num" data-id="${id}" data-dir="-1">–</button>
-            <span class="sv">${v != null ? v : "–"}${unit}</span>
-            <button class="sb" data-action="num" data-id="${id}" data-dir="1">+</button>
+            <button class="sb" data-action="num" data-id="${id}" data-dir="${lDir}">–</button>
+            <span class="sv">${disp}${unit}</span>
+            <button class="sb" data-action="num" data-id="${id}" data-dir="${rDir}">+</button>
           </div>`;
       };
 
@@ -359,7 +365,7 @@
         <div class="seg">${seg}</div>
         ${fanRow}
         <div class="steppers">
-          ${stepper(this._ent.bandLow, "band low")}
+          ${stepper(this._ent.bandLow, "band low", true)}
           ${stepper(this._ent.bandHigh, "band high (fan)")}
           ${stepper(this._ent.bandHighNoFan, "band high (no fan)")}
           ${stepper(this._ent.hardMin, "hard min")}
@@ -459,6 +465,7 @@
       const now = new Date();
       const nowFrac = (now.getHours() * 60 + now.getMinutes()) / 1440;
       const nowX = padL + nowFrac * iw;
+      const nowHf = nowFrac * 24;
 
       const comfort = fnum(this._st(this._ent.comfort)?.state);
       let line = "", area = `M${X(0)} ${padT + ih} `;
@@ -485,7 +492,9 @@
       // Actual comfort on the same axes as the target, mapped by hour-of-day.
       // Each calendar-day bucket is contiguous (hour-of-day only increases within
       // a day) so each is a single clean polyline — no seam handling needed.
-      // Today = SOLID (00:00 → now); yesterday = DOTTED full-width reference.
+      // Today = SOLID (00:00 → now). Yesterday = a THIN solid line, drawn only for
+      // the part of the day that hasn't happened yet (now → 24) — so together they
+      // read as one continuous rolling trace with no overlap.
       const XA = (hf) => padL + (clamp(hf, 0, 24) / 24) * iw;
       const act = this._actual || { today: [], yesterday: [] };
       const buildPath = (pts) => {
@@ -494,10 +503,10 @@
         pts.forEach((p, i) => { d += (i ? "L" : "M") + XA(p.hf).toFixed(1) + " " + Y(clamp(p.t, T_MIN, T_MAX)).toFixed(1) + " "; });
         return d.trim();
       };
-      const yPath = buildPath(act.yesterday);
+      const yPath = buildPath((act.yesterday || []).filter((p) => p.hf >= nowHf));
       const tPath = buildPath(act.today);
       let actualLine = "";
-      if (yPath) actualLine += `<path d="${yPath}" fill="none" stroke="${C.warm}" stroke-width="1" stroke-opacity="0.5" stroke-dasharray="2 3" stroke-linejoin="round" stroke-linecap="round"/>`;
+      if (yPath) actualLine += `<path d="${yPath}" fill="none" stroke="${C.warm}" stroke-width="1" stroke-opacity="0.5" stroke-linejoin="round" stroke-linecap="round"/>`;
       if (tPath) actualLine += `<path d="${tPath}" fill="none" stroke="${C.warm}" stroke-width="1.5" stroke-opacity="0.9" stroke-linejoin="round" stroke-linecap="round"/>`;
 
       this.shadowRoot.getElementById("sched").innerHTML = `
@@ -519,7 +528,7 @@
         <div class="hint">Drag to shape the day’s target
           <span class="lg"><i class="sw" style="background:var(--primary-color)"></i>target</span>
           <span class="lg"><i class="sw" style="background:${C.warm}"></i>actual today</span>
-          <span class="lg"><i class="sw dot" style="border-top:1px dotted ${C.warm};background:none"></i>yesterday</span></div>`;
+          <span class="lg"><i class="sw" style="background:${C.warm};opacity:.5;height:1px"></i>yesterday (ahead)</span></div>`;
 
       const svg = this.shadowRoot.getElementById("sched-svg");
       const geo = { W, H, padL, padR, padT, padB, iw, ih, X, Y };

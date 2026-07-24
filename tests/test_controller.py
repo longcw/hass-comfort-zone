@@ -71,6 +71,20 @@ def test_asymmetric_band():
     check(cmd2.mode == const.MODE_EASING, f"25.2 below low bound should ease, got {cmd2.mode}")
 
 
+def test_blower_drops_to_low_at_or_below_target():
+    # comfort below target, blower at 中 (idx1) → step down to 低 (idx0)
+    c = fresh()
+    cmd = c.tick(sig(comfort=25.8, setpoint=26, blower_idx=1, slope=0.0), params())
+    check(cmd.set_blower_idx == 0, f"at/below target blower should drop to 低(0), got {cmd.set_blower_idx}")
+
+
+def test_blower_rises_to_mid_when_warm_at_floor():
+    # warm, setpoint already at floor, blower 低 → step up to 中 (regular max)
+    c = fresh()
+    cmd = c.tick(sig(comfort=27.0, setpoint=24, blower_idx=0, slope=0.0), params())
+    check(cmd.set_blower_idx == 1, f"warm at floor should raise blower to 中(1), got {cmd.set_blower_idx}")
+
+
 def test_mild_warm_uses_fan_first():
     # within band but above target → the cheap actuator (fan) engages, AC does not
     c = fresh()

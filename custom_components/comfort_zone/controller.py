@@ -45,6 +45,7 @@ FAN_HYST = 0.1            # °C hysteresis around target for fan on/off
 FAN_SPAN = 2.0           # °C above target at which the fan reaches its cap
 FF_NUDGE = 0.3           # °C the power feedforward shifts the effective temp
 MIN_DWELL_FLOOR = 3.0    # minutes; hard floor between setpoint commands
+BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
 
 
 @dataclass
@@ -97,6 +98,7 @@ class Controller:
         self._last_cmd_at: datetime | None = None
         self._power_at_cmd: float | None = None
         self._last_cmd_cooling = False
+        self._last_blower_at: datetime | None = None
         self._managed_off_since: datetime | None = None
 
     # -- helpers ------------------------------------------------------------
@@ -121,19 +123,34 @@ class Controller:
     def _cool_start_setpoint(self, p: ZoneParams) -> int:
         return max(p.setpoint_min, min(p.setpoint_max, round(p.target) - 1))
 
-    def _raise_blower(self, cmd: Command, s: Signals, p: ZoneParams) -> bool:
-        cur = s.blower_idx if s.blower_idx is not None else 0
-        if cur >= p.regular_blower_max:
-            return False
-        cmd.set_blower_idx = cur + 1
-        return True
+    def _manage_blower(self, cmd: Command, s: Signals, p: ZoneParams,
+                       y: float, hi: float, falling: bool) -> None:
+        """Track blower to cooling demand, one level per dwell.
 
-    def _lower_blower(self, cmd: Command, s: Signals, p: ZoneParams) -> bool:
+        低风 (quiet, least draft) whenever comfort is at/below target; 中风 only
+        when warm AND the setpoint is already floored (needs more cold air);
+        left as-is in the warm-but-not-floored middle (no flapping). 高风 is
+        reserved for the safety guard.
+        """
+        if not p.blower_levels or cmd.set_blower_idx is not None:
+            return
         cur = s.blower_idx if s.blower_idx is not None else 0
-        if cur <= 0:
-            return False
-        cmd.set_blower_idx = cur - 1
-        return True
+        cooling_hard = y > hi and s.setpoint is not None and s.setpoint <= p.setpoint_min and not falling
+        if cooling_hard:
+            desired = p.regular_blower_max
+        elif y <= p.target:
+            desired = 0
+        else:
+            return  # warm but not floored → leave the blower where it is
+        if desired == cur:
+            return
+        if self._last_blower_at is not None and \
+                (s.now - self._last_blower_at).total_seconds() / 60.0 < BLOWER_DWELL:
+            return
+        cmd.set_blower_idx = cur + (1 if desired > cur else -1)
+        self._last_blower_at = s.now
+        note = f"blower→{p.blower_levels[cmd.set_blower_idx]}"
+        cmd.reason = f"{cmd.reason}; {note}" if cmd.reason else note
 
     def _power_engaged(self, s: Signals) -> bool:
         """Has demand risen since our last cooling command? (fast, ~1–2 min)"""
@@ -209,12 +226,9 @@ class Controller:
                 self._command_setpoint(cmd, s, s.setpoint - 1)
                 cmd.mode = MODE_COOLING
                 cmd.reason = f"warm ({y:.2f}) & not enough cooling in flight → setpoint {cmd.set_setpoint}"
-            elif not falling and self._raise_blower(cmd, s, p):
-                cmd.mode = MODE_COOLING
-                cmd.reason = f"warm at setpoint floor → blower {p.blower_levels[cmd.set_blower_idx]}"
             else:
                 cmd.mode = MODE_COOLING
-                cmd.reason = f"warm ({y:.2f}) → holding at limits"
+                cmd.reason = f"warm ({y:.2f}) at setpoint floor → holding (blower/fan carry)"
 
         # === 3. COLD ========================================================
         elif settled < lo or y < lo:
@@ -226,9 +240,8 @@ class Controller:
                 cmd.reason = f"cold ({y:.2f}) → ease fan first"
             elif s.ac_on and s.setpoint is not None and s.setpoint < p.setpoint_max and mins >= self._step_dwell():
                 self._command_setpoint(cmd, s, s.setpoint + 1)
-                self._lower_blower(cmd, s, p)
                 cmd.mode = MODE_EASING
-                cmd.reason = f"cold ({y:.2f}) → setpoint {cmd.set_setpoint}, quieter blower"
+                cmd.reason = f"cold ({y:.2f}) → setpoint {cmd.set_setpoint}"
             elif s.ac_on and s.setpoint is not None and s.setpoint >= p.setpoint_max and settled < lo:
                 cmd.set_ac_power = False
                 self._managed_off_since = s.now
@@ -243,7 +256,8 @@ class Controller:
             cmd.mode = MODE_IDLE
             cmd.reason = f"on target ({y:.2f} in [{lo:.2f},{hi:.2f}])"
 
-        # === 5. Fan comfort layer ==========================================
+        # === 5. AC blower + fan comfort layer ==============================
+        self._manage_blower(cmd, s, p, y, hi, falling)
         self._fan_layer(cmd, s, p, trend, cooling_incoming, warming_incoming)
         if cmd.mode == MODE_IDLE and (cmd.set_fan or cmd.set_fan_level is not None):
             cmd.mode = MODE_FAN_ASSIST
