@@ -52,24 +52,48 @@
       {t:t(2),  mode:"cooling", reason:"managed-off return: comfort 26.0 ≥ target 26.0", actions:["ac_power=on","setpoint=25"], comfort:26.0, target:26.0, power:110},
     ];
     const S = "sensor.master_bedroom_status";
+    const entMap = {
+      status:S, ac:"climate.bedroom_ac", ac_power_switch:"switch.bedroom_ac_power",
+      power:"sensor.ac_power", fan:"fan.bedroom_fan", fan_speed:"number.bedroom_fan_speed",
+      temp:"sensor.crib_temp", humidity:"sensor.crib_humidity", comfort:null };
     const states = {
       [S]: { entity_id:S, state:"cooling", attributes:{
         friendly_name:"Master bedroom Status", reason:recent_log[recent_log.length-1].reason,
         strategy:"baby", safety_state:"normal", enabled:true, is_night:false,
         slope:0.03, power:1120, power_delta:180, setpoint:25, fan_level:20, band:0.4,
-        schedule, recent_log } },
+        ac_on:true, ac_state:"cool", ac_blower:"中风", fan_on:true, fan_assist_enabled:true,
+        entities:entMap, schedule, recent_log } },
       "sensor.master_bedroom_comfort_temperature": {state:"26.1", attributes:{friendly_name:"Master bedroom Comfort temperature"}},
       "sensor.master_bedroom_target": {state:"26.0", attributes:{friendly_name:"Master bedroom Target"}},
       "sensor.master_bedroom_predicted_settled": {state:"25.7", attributes:{friendly_name:"Master bedroom Predicted settled"}},
       "select.master_bedroom_strategy": {state:"baby", attributes:{friendly_name:"Master bedroom Strategy"}},
       "switch.master_bedroom_enabled": {state:"on", attributes:{friendly_name:"Master bedroom Enabled"}},
-      "number.master_bedroom_band": {state:"0.4", attributes:{friendly_name:"Master bedroom Band (± tolerance)", unit_of_measurement:"°C", step:0.05, min:0.2, max:1.5}},
-      "number.master_bedroom_hard_min": {state:"23", attributes:{friendly_name:"Master bedroom Hard min (safety)", unit_of_measurement:"°C", step:0.5, min:20, max:26}},
-      "number.master_bedroom_hard_max": {state:"29", attributes:{friendly_name:"Master bedroom Hard max (safety)", unit_of_measurement:"°C", step:0.5, min:27, max:32}},
+      "switch.master_bedroom_fan_assist": {state:"on", attributes:{friendly_name:"Master bedroom Fan assist"}},
+      "number.master_bedroom_band_fan_on": {state:"0.4", attributes:{friendly_name:"Master bedroom Band (fan on)", unit_of_measurement:"°C", step:0.05, min:0.2, max:1.5}},
+      "number.master_bedroom_band_fan_off": {state:"0.3", attributes:{friendly_name:"Master bedroom Band (fan off)", unit_of_measurement:"°C", step:0.05, min:0.2, max:1.5}},
+      "number.master_bedroom_fan_max_day": {state:"40", attributes:{friendly_name:"Master bedroom Fan max (day)", unit_of_measurement:"%", step:5, min:10, max:100}},
+      "number.master_bedroom_hard_min_safety": {state:"23", attributes:{friendly_name:"Master bedroom Hard min (safety)", unit_of_measurement:"°C", step:0.5, min:20, max:26}},
+      "number.master_bedroom_hard_max_safety": {state:"29", attributes:{friendly_name:"Master bedroom Hard max (safety)", unit_of_measurement:"°C", step:0.5, min:27, max:32}},
     };
     const entities = {}; Object.keys(states).forEach(id=>entities[id]={entity_id:id, device_id:"dev1"});
+    // Mock a rolling ~25h comfort trace (spans both sides of the now-marker).
+    function genTrace(){
+      const pts=[]; const now=Date.now();
+      for (let m=25*60; m>=0; m-=15) {
+        const ts = now - m*60000;
+        const h = (25*60 - m)/60;
+        const temp = 26.2 + 0.8*Math.sin(h/3.4) + 0.25*Math.sin(h/0.9);
+        pts.push({ s: temp.toFixed(2), lu: Math.floor(ts/1000) });
+      }
+      return pts;
+    }
     const hass = { states, entities, devices:{dev1:{name:"Master bedroom"}},
-      callService:(d,s,data)=>{ console.log("callService", d, s, data); return Promise.resolve(); } };
+      callService:(d,s,data)=>{ console.log("callService", d, s, data); return Promise.resolve(); },
+      callWS:(msg)=>{
+        if (msg && msg.type==="history/history_during_period" && msg.entity_ids)
+          return Promise.resolve({ [msg.entity_ids[0]]: genTrace() });
+        return Promise.resolve({});
+      } };
     for (const id of ["a","b"]) {
       const el = document.getElementById(id);
       el.setConfig({ type:"custom:comfort-zone-card", zone:S });

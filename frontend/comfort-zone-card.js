@@ -59,6 +59,8 @@
       this._draft = null;       // local schedule edits (null = follow the entity)
       this._dragging = false;
       this._lastSig = null;
+      this._actual = null;      // cached actual-comfort trace for today [{hf, t}]
+      this._actualFetchedAt = 0;
       if (!this.shadowRoot) this.attachShadow({ mode: "open" });
       this._buildShell();
     }
@@ -186,6 +188,44 @@
       this._renderTune(status);
       this._renderHistory(status);
       if (!this._dragging) this._renderSchedule(status); // don't clobber a live drag
+      this._maybeFetchActual();
+    }
+
+    // -- actual comfort trace (rolling 24h) ----------------------------------
+    // Fetch a trailing ~25h of the room's real comfort so it can be overlaid on
+    // the target curve, plotted by LOCAL hour-of-day: hours left of the now-marker
+    // are today's actual, hours to the right are yesterday's for those hours — so
+    // the full 0–24h always has a trace and it rolls as the day advances.
+    // Throttled to ≤ once / 3 min; cached and redrawn from cache otherwise.
+    _maybeFetchActual() {
+      const id = this._ent && this._ent.comfort;
+      if (!id || !this._hass || !this._hass.callWS) return;
+      const nowMs = Date.now();
+      if (this._actualFetchedAt && nowMs - this._actualFetchedAt < 180000) return;
+      this._actualFetchedAt = nowMs; // set first so overlapping updates don't refetch
+      const start = new Date(nowMs - 25 * 3600 * 1000);
+      this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: start.toISOString(),
+        end_time: new Date().toISOString(),
+        entity_ids: [id],
+        minimal_response: true,
+        no_attributes: true,
+      }).then((res) => {
+        const arr = (res && res[id]) || [];
+        const pts = [];
+        for (const p of arr) {
+          const v = fnum(p.s);
+          const lu = p.lu != null ? p.lu : p.last_updated;
+          if (v == null || lu == null) continue;
+          const d = new Date(lu * 1000);
+          pts.push({ lu, hf: d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600, t: v });
+        }
+        pts.sort((a, b) => a.lu - b.lu); // TIME order — seam handled at render
+        this._actual = pts;
+        const status = this._st(this._config.zone);
+        if (status && !this._dragging) this._renderSchedule(status);
+      }).catch(() => { /* no history → just skip the overlay */ });
     }
 
     // -- header / live state -------------------------------------------------
@@ -423,6 +463,24 @@
         ? `<circle cx="${nowX.toFixed(1)}" cy="${Y(clamp(comfort, T_MIN, T_MAX)).toFixed(1)}" r="4" fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>`
         : "";
 
+      // Actual comfort trace for today (00:00 → now), on the same axes as the
+      // target so the two can be compared while shaping the curve. Mapped on the
+      // /24 hour scale so it ends exactly at the now-marker.
+      const XA = (hf) => padL + (clamp(hf, 0, 24) / 24) * iw;
+      const apts = this._actual || [];
+      let actualLine = "";
+      if (apts.length) {
+        // Walk in time order; start a new segment whenever hour-of-day drops
+        // (midnight crossing) so there's no false vertical line at the seam.
+        let prevHf = null, dpath = "";
+        for (const p of apts) {
+          const cmd = (prevHf == null || p.hf < prevHf) ? "M" : "L";
+          dpath += cmd + XA(p.hf).toFixed(1) + " " + Y(clamp(p.t, T_MIN, T_MAX)).toFixed(1) + " ";
+          prevHf = p.hf;
+        }
+        actualLine = `<path d="${dpath}" fill="none" stroke="${C.warm}" stroke-width="1.5" stroke-opacity="0.7" stroke-linejoin="round" stroke-linecap="round"/>`;
+      }
+
       this.shadowRoot.getElementById("sched").innerHTML = `
         <svg id="sched-svg" viewBox="0 0 ${W} ${H}" class="schedsvg" touch-action="none">
           <defs>
@@ -433,12 +491,15 @@
           </defs>
           ${yticks}${grid}
           <path d="${area}" fill="url(#czgrad)"/>
+          ${actualLine}
           <path d="${line}" fill="none" stroke="var(--primary-color)" stroke-width="2" stroke-linejoin="round"/>
           ${dots}
           <line x1="${nowX.toFixed(1)}" y1="${padT}" x2="${nowX.toFixed(1)}" y2="${padT + ih}" class="now"/>
           ${nowDot}
         </svg>
-        <div class="hint">Drag to shape the day’s target · now marked in blue</div>`;
+        <div class="hint">Drag to shape the day’s target
+          <span class="lg"><i class="sw" style="background:var(--primary-color)"></i>target</span>
+          <span class="lg"><i class="sw" style="background:${C.warm}"></i>actual feel</span></div>`;
 
       const svg = this.shadowRoot.getElementById("sched-svg");
       const geo = { W, H, padL, padR, padT, padB, iw, ih, X, Y };
@@ -588,6 +649,8 @@
     .schedsvg .dot { fill: var(--primary-color); opacity:.5; }
     .schedsvg .now { stroke: ${C.cool}; stroke-width:1.5; stroke-dasharray:3 2; opacity:.8; }
     .hint { font-size:11px; color: var(--secondary-text-color); margin-top:4px; text-align:center; }
+    .hint .lg { margin-left:8px; white-space:nowrap; }
+    .hint .sw { display:inline-block; width:9px; height:2px; border-radius:1px; margin-right:3px; vertical-align:middle; }
 
     /* tuning */
     .seg { display:flex; gap:0; border:1px solid var(--divider-color); border-radius:8px; overflow:hidden; margin-bottom:10px; }
