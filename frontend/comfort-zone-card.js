@@ -568,7 +568,7 @@
         const sx = ((ev.clientX - r.left) / r.width) * W;
         const sy = ((ev.clientY - r.top) / r.height) * H;
         const i = clamp(Math.round(((sx - padL) / iw) * (SLOTS - 1)), 0, SLOTS - 1);
-        const t = clamp(snap(T_MAX - ((sy - padT) / ih) * (T_MAX - T_MIN), 0.2), T_MIN, T_MAX);
+        const t = clamp(snap(T_MAX - ((sy - padT) / ih) * (T_MAX - T_MIN), 0.1), T_MIN, T_MAX);
         return { i, t };
       };
       let lastI = null;
