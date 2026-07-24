@@ -16,7 +16,7 @@ with stub data (light + dark).
    cp comfort-zone-card.js /path/to/homeassistant/config/www/comfort-zone-card.js
    ```
 
-   (Over SSH to the VM: `scp comfort-zone-card.js longc@192.168.100.198:~/homeassistant/config/www/`)
+   (Or `scp` it to your HA host's `config/www/` directory.)
 
 2. Register it as a Lovelace resource — **Settings → Dashboards → ⋮ → Resources
    → Add resource**:
