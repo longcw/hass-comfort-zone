@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Comfort Zone Card — preview</title>
+  <style>
+    /* Minimal stand-ins for the HA theme variables the card consumes. */
+    :root, .light {
+      --card-background-color:#fff; --secondary-background-color:#f2f4f7;
+      --primary-text-color:#1c1e21; --secondary-text-color:#6b7280;
+      --divider-color:#e2e5e9; --primary-color:#3b8ff0; --text-primary-color:#fff;
+      --code-font-family: ui-monospace, Menlo, monospace; --primary-font-family: system-ui, sans-serif;
+    }
+    .dark {
+      --card-background-color:#1c1f26; --secondary-background-color:#262b34;
+      --primary-text-color:#e6e8eb; --secondary-text-color:#9aa1ab;
+      --divider-color:#333a44; --primary-color:#4a9eff; --text-primary-color:#0b0d10;
+    }
+    body { margin:0; font-family:system-ui, sans-serif; background:#e9ecef; }
+    .dark { background:#0d0f13; }
+    .wrap { display:flex; gap:24px; padding:24px; align-items:flex-start; flex-wrap:wrap; }
+    .col { width:440px; max-width:95vw; }
+    ha-card { display:block; background:var(--card-background-color); color:var(--primary-text-color);
+      border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,.12); }
+    h3 { font:600 13px system-ui; color:#555; }
+    .dark h3 { color:#aaa; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="col light"><h3>LIGHT</h3><comfort-zone-card id="a"></comfort-zone-card></div>
+    <div class="col dark"><h3>DARK</h3><comfort-zone-card id="b"></comfort-zone-card></div>
+  </div>
+  <script src="./comfort-zone-card.js"></script>
+  <script>
+    // A representative schedule: cool overnight, warmer midday, cool evening.
+    const schedule = Array.from({length:48}, (_,i)=>{
+      const h = i/2;
+      if (h>=1 && h<7) return 26.5;          // night — quieter/warmer
+      if (h>=12 && h<16) return 25.5;         // hot afternoon — cooler
+      return 26.0;
+    });
+    const now = new Date();
+    const t = (m)=> new Date(now-m*60000).toISOString();
+    const recent_log = [
+      {t:t(46), mode:"cooling", reason:"warm & AC off → power on, setpoint 25", actions:["ac_power=on","setpoint=25"], comfort:27.3, target:26.0, power:120},
+      {t:t(40), mode:"cooling", reason:"not engaged after 4m (Δpower≈+30W) → escalate to 24", actions:["setpoint=24"], comfort:27.2, target:26.0, power:150},
+      {t:t(33), mode:"fan_assist", reason:"mild warmth → fan on", actions:["fan=on","fan_level=18"], comfort:26.6, target:26.0, power:980},
+      {t:t(21), mode:"easing", reason:"cold (settled 25.6 < 25.6) → setpoint 25, quieter", actions:["setpoint=25","blower=低风"], comfort:25.6, target:26.0, power:1120},
+      {t:t(9),  mode:"managed_off", reason:"overcooling at setpoint ceiling → managed AC-off", actions:["ac_power=off","fan=off"], comfort:25.1, target:26.0, power:60},
+      {t:t(2),  mode:"cooling", reason:"managed-off return: comfort 26.0 ≥ target 26.0", actions:["ac_power=on","setpoint=25"], comfort:26.0, target:26.0, power:110},
+    ];
+    const S = "sensor.master_bedroom_status";
+    const states = {
+      [S]: { entity_id:S, state:"cooling", attributes:{
+        friendly_name:"Master bedroom Status", reason:recent_log[recent_log.length-1].reason,
+        strategy:"baby", safety_state:"normal", enabled:true, is_night:false,
+        slope:0.03, power:1120, power_delta:180, setpoint:25, fan_level:20, band:0.4,
+        schedule, recent_log } },
+      "sensor.master_bedroom_comfort_temperature": {state:"26.1", attributes:{friendly_name:"Master bedroom Comfort temperature"}},
+      "sensor.master_bedroom_target": {state:"26.0", attributes:{friendly_name:"Master bedroom Target"}},
+      "sensor.master_bedroom_predicted_settled": {state:"25.7", attributes:{friendly_name:"Master bedroom Predicted settled"}},
+      "select.master_bedroom_strategy": {state:"baby", attributes:{friendly_name:"Master bedroom Strategy"}},
+      "switch.master_bedroom_enabled": {state:"on", attributes:{friendly_name:"Master bedroom Enabled"}},
+      "number.master_bedroom_band": {state:"0.4", attributes:{friendly_name:"Master bedroom Band (± tolerance)", unit_of_measurement:"°C", step:0.05, min:0.2, max:1.5}},
+      "number.master_bedroom_hard_min": {state:"23", attributes:{friendly_name:"Master bedroom Hard min (safety)", unit_of_measurement:"°C", step:0.5, min:20, max:26}},
+      "number.master_bedroom_hard_max": {state:"29", attributes:{friendly_name:"Master bedroom Hard max (safety)", unit_of_measurement:"°C", step:0.5, min:27, max:32}},
+    };
+    const entities = {}; Object.keys(states).forEach(id=>entities[id]={entity_id:id, device_id:"dev1"});
+    const hass = { states, entities, devices:{dev1:{name:"Master bedroom"}},
+      callService:(d,s,data)=>{ console.log("callService", d, s, data); return Promise.resolve(); } };
+    for (const id of ["a","b"]) {
+      const el = document.getElementById(id);
+      el.setConfig({ type:"custom:comfort-zone-card", zone:S });
+      el.hass = hass;
+    }
+  </script>
+</body>
+</html>
