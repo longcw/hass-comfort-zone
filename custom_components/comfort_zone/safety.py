@@ -88,11 +88,11 @@ class SafetyGuard:
         # --- truly gone: no value at all → park safely ---------------------
         if s.comfort is None:
             self._enter(STATE_FAILSAFE, now)
-            park = int(math.floor(p.target - p.band))
+            park = int(math.floor(p.target - p.band_low))
             park = max(p.setpoint_min, min(p.setpoint_max, park))
             return Command(
                 mode=MODE_FAILSAFE,
-                reason=f"sensor unavailable → park AC at floor(target−band)={park}, fan off",
+                reason=f"sensor unavailable → park AC at floor(target−band_low)={park}, fan off",
                 set_setpoint=park,
                 set_ac_power=None,   # leave power as-is; just fix the setpoint
                 set_fan=False,

@@ -37,9 +37,13 @@ OPT_SCHEDULE: Final = "schedule"                   # list[float] len 48 (30-min 
 OPT_COMFORT_K: Final = "comfort_k"                 # humidity weight, 0..1
 OPT_COMFORT_RH_REF: Final = "comfort_rh_ref"       # anchor RH (signal == raw temp here)
 
-# Band / setpoint envelope.
-OPT_BAND: Final = "band"                           # ± tolerance around target, °C (fan-assist on)
-OPT_BAND_NO_FAN: Final = "band_no_fan"             # tighter ± tolerance when fan-assist is off
+# Band / setpoint envelope. The comfort band is ASYMMETRIC:
+#   [ target - band_low , target + band_high ]
+# The low (cold) side is the same regardless of the fan; the high (warm) side
+# tightens when fan-assist is off (no air movement to make warmth tolerable).
+OPT_BAND_LOW: Final = "band_low"                   # °C below target before easing
+OPT_BAND_HIGH: Final = "band_high"                 # °C above target before cooling (fan on)
+OPT_BAND_HIGH_NO_FAN: Final = "band_high_no_fan"   # warm-side tolerance when fan off (tighter)
 OPT_SETPOINT_MIN: Final = "setpoint_min"
 OPT_SETPOINT_MAX: Final = "setpoint_max"
 
@@ -92,21 +96,27 @@ STRATEGIES: Final = [STRATEGY_BABY, STRATEGY_ECO, STRATEGY_COMFORT, STRATEGY_CUS
 
 STRATEGY_PRESETS: Final = {
     STRATEGY_BABY: {
-        OPT_BAND: 0.4,
+        OPT_BAND_LOW: 0.4,
+        OPT_BAND_HIGH: 0.5,
+        OPT_BAND_HIGH_NO_FAN: 0.3,
         OPT_FAN_MAX_DAY: 40,
         OPT_FAN_MAX_NIGHT: 25,
         OPT_SAFETY_MARGIN: 1.4,
         OPT_SAFETY_COOLDOWN_MIN: 12,
     },
     STRATEGY_ECO: {
-        OPT_BAND: 0.7,
+        OPT_BAND_LOW: 0.5,
+        OPT_BAND_HIGH: 0.9,
+        OPT_BAND_HIGH_NO_FAN: 0.6,
         OPT_FAN_MAX_DAY: 70,
         OPT_FAN_MAX_NIGHT: 40,
         OPT_SAFETY_MARGIN: 1.6,
         OPT_SAFETY_COOLDOWN_MIN: 15,
     },
     STRATEGY_COMFORT: {
-        OPT_BAND: 0.35,
+        OPT_BAND_LOW: 0.35,
+        OPT_BAND_HIGH: 0.45,
+        OPT_BAND_HIGH_NO_FAN: 0.3,
         OPT_FAN_MAX_DAY: 60,
         OPT_FAN_MAX_NIGHT: 35,
         OPT_SAFETY_MARGIN: 1.3,
@@ -120,8 +130,9 @@ OPTION_DEFAULTS: Final = {
     OPT_STRATEGY: STRATEGY_BABY,
     OPT_COMFORT_K: 0.35,
     OPT_COMFORT_RH_REF: 55.0,
-    OPT_BAND: 0.4,
-    OPT_BAND_NO_FAN: 0.3,
+    OPT_BAND_LOW: 0.4,
+    OPT_BAND_HIGH: 0.5,
+    OPT_BAND_HIGH_NO_FAN: 0.3,
     OPT_SETPOINT_MIN: 24,
     OPT_SETPOINT_MAX: 27,
     OPT_FAN_MIN_LEVEL: 10,

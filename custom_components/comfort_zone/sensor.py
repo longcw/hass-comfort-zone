@@ -73,7 +73,8 @@ class _StatusSensor(ComfortZoneEntity, SensorEntity):
             "ac_on": s.get("ac_on"),
             "ac_state": s.get("ac_state"),
             "ac_blower": s.get("ac_blower"),
-            "band": s.get("band"),
+            "band_low": s.get("band_low"),
+            "band_high": s.get("band_high"),
             "last_actions": s.get("last_actions"),
             "entities": entities,
             # consumed by the custom card:

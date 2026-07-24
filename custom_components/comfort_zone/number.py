@@ -10,8 +10,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     DOMAIN,
-    OPT_BAND,
-    OPT_BAND_NO_FAN,
+    OPT_BAND_HIGH,
+    OPT_BAND_HIGH_NO_FAN,
+    OPT_BAND_LOW,
     OPT_FAN_MAX_DAY,
     OPT_FAN_MAX_NIGHT,
     OPT_HARD_MAX,
@@ -34,8 +35,9 @@ class Knob:
 
 
 KNOBS: tuple[Knob, ...] = (
-    Knob(OPT_BAND, "Band (fan on)", 0.2, 1.5, 0.05, "°C", "mdi:arrow-expand-vertical"),
-    Knob(OPT_BAND_NO_FAN, "Band (fan off)", 0.2, 1.5, 0.05, "°C", "mdi:arrow-collapse-vertical"),
+    Knob(OPT_BAND_LOW, "Band low (cold side)", 0.1, 1.5, 0.05, "°C", "mdi:arrow-down-thin"),
+    Knob(OPT_BAND_HIGH, "Band high (fan on)", 0.1, 1.5, 0.05, "°C", "mdi:arrow-up-thin"),
+    Knob(OPT_BAND_HIGH_NO_FAN, "Band high (fan off)", 0.1, 1.5, 0.05, "°C", "mdi:arrow-collapse-up"),
     Knob(OPT_HARD_MIN, "Hard min (safety)", 20, 26, 0.5, "°C", "mdi:thermometer-low"),
     Knob(OPT_HARD_MAX, "Hard max (safety)", 27, 32, 0.5, "°C", "mdi:thermometer-high"),
     Knob(OPT_SETPOINT_MIN, "AC setpoint min", 16, 27, 1, "°C", "mdi:snowflake"),

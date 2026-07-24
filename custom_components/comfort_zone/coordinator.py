@@ -33,8 +33,9 @@ from .const import (
     CONF_TEMP_SENSOR,
     DOMAIN,
     MODE_IDLE,
-    OPT_BAND,
-    OPT_BAND_NO_FAN,
+    OPT_BAND_HIGH,
+    OPT_BAND_HIGH_NO_FAN,
+    OPT_BAND_LOW,
     OPT_COMFORT_K,
     OPT_COMFORT_RH_REF,
     OPT_FAN_MAX_DAY,
@@ -223,10 +224,12 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         target = self.store.target_at(local.hour, local.minute, opts[OPT_STRATEGY])
         is_night = self._is_night(opts)
 
-        band = float(opts[OPT_BAND_NO_FAN]) if not self.fan_assist else float(opts[OPT_BAND])
+        band_low = float(opts[OPT_BAND_LOW])
+        band_high = float(opts[OPT_BAND_HIGH_NO_FAN] if not self.fan_assist else opts[OPT_BAND_HIGH])
         params = ZoneParams(
             target=target,
-            band=band,
+            band_low=band_low,
+            band_high=band_high,
             setpoint_min=int(opts[OPT_SETPOINT_MIN]),
             setpoint_max=int(opts[OPT_SETPOINT_MAX]),
             blower_levels=blower_levels,
@@ -320,7 +323,8 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             "slope": signals.slope,
             "target": target,
             "predicted": predicted,
-            "band": opts[OPT_BAND],
+            "band_low": float(opts[OPT_BAND_LOW]),
+            "band_high": float(opts[OPT_BAND_HIGH_NO_FAN] if not self.fan_assist else opts[OPT_BAND_HIGH]),
             "power": signals.power,
             "power_delta": signals.power_delta,
             "setpoint": signals.setpoint,

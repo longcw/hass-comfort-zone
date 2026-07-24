@@ -18,10 +18,11 @@ BLOWERS = ["低风", "中风", "高风"]
 T0 = datetime(2026, 7, 24, 12, 0, 0)
 
 
-def params(target=26.0, band=0.4):
+def params(target=26.0, band_low=0.4, band_high=0.4):
     return ZoneParams(
         target=target,
-        band=band,
+        band_low=band_low,
+        band_high=band_high,
         setpoint_min=24,
         setpoint_max=27,
         blower_levels=BLOWERS,
@@ -56,6 +57,18 @@ def test_in_band_is_idle():
     check(cmd.set_ac_power is None, "should not toggle AC in band")
     check(not cmd.set_fan, f"fan should stay off in band, got {cmd.set_fan}")
     check(cmd.mode == const.MODE_IDLE, f"expected idle, got {cmd.mode}")
+
+
+def test_asymmetric_band():
+    # target 25.7, low 0.4 (→25.3), high 0.7 (→26.4): 26.3 is still IN band,
+    # but 25.2 is cold. Warm side tolerates more than cold side.
+    c = fresh()
+    p = params(target=25.7, band_low=0.4, band_high=0.7)
+    cmd = c.tick(sig(comfort=26.3, setpoint=25, slope=0.0), p)
+    check(cmd.set_setpoint is None, f"26.3 within [25.3,26.4] must not cool, got {cmd.set_setpoint}")
+    c2 = fresh()
+    cmd2 = c2.tick(sig(comfort=25.2, setpoint=25, fan_on=False, slope=0.0), p)
+    check(cmd2.mode == const.MODE_EASING, f"25.2 below low bound should ease, got {cmd2.mode}")
 
 
 def test_mild_warm_uses_fan_first():
@@ -152,7 +165,7 @@ def test_safety_unavailable_parks_at_floor():
     g = SafetyGuard()
     sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
     opt = Command(mode=const.MODE_COOLING, set_setpoint=24)
-    out = g.evaluate(sig(comfort=None), params(target=26.0, band=0.4), sp, opt, stale=True)
+    out = g.evaluate(sig(comfort=None), params(target=26.0, band_low=0.4), sp, opt, stale=True)
     check(out.mode == const.MODE_FAILSAFE, f"expected failsafe, got {out.mode}")
     check(out.set_setpoint == 25, f"park at floor(26-0.4)=25, got {out.set_setpoint}")
     check(out.set_fan is False, "failsafe stops the fan")

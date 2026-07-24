@@ -64,7 +64,8 @@ class Signals:
 @dataclass
 class ZoneParams:
     target: float
-    band: float
+    band_low: float                # °C below target before easing
+    band_high: float               # °C above target before cooling (fan-resolved)
     setpoint_min: int
     setpoint_max: int
     blower_levels: list[str]
@@ -146,8 +147,8 @@ class Controller:
             return Command(mode=MODE_FAILSAFE, reason="no comfort reading")
 
         m = self.predictor.params
-        hi = p.target + p.band
-        lo = p.target - p.band
+        hi = p.target + p.band_high
+        lo = p.target - p.band_low
         y = s.comfort
         slope = s.slope if s.slope is not None else 0.0
         falling = slope <= -SLOPE_EPS
