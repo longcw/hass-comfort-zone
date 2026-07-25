@@ -48,6 +48,14 @@ FAN_SPAN = 2.0           # °C above target at which the fan reaches its cap
 FF_NUDGE = 0.3           # °C the power feedforward shifts the effective temp
 MIN_DWELL_FLOOR = 6.0    # minutes; hard floor between setpoint commands (pace the compressor)
 BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
+RAIL_KEEPOUT = 0.1       # °C of the band→rail clearance the deadband may never use
+
+
+def _rail_limited(margin: float, edge: float, rail: float | None) -> float:
+    """Trim a deadband margin so it stops short of the safety rail behind it."""
+    if rail is None:
+        return margin
+    return max(0.0, min(margin, abs(rail - edge) - RAIL_KEEPOUT))
 
 
 @dataclass
@@ -76,6 +84,8 @@ class ZoneParams:
     fan_max_level: int
     managed_off_max_min: float
     fan_assist_enabled: bool = True
+    hard_min: float | None = None   # safety rails, so the learned deadband
+    hard_max: float | None = None   # can never widen into a guard trip
 
     @property
     def regular_blower_max(self) -> int:
@@ -170,9 +180,14 @@ class Controller:
         # Cost-split: the fan works the comfort band [lo,hi]; the AC blower works
         # the mid-zone; the SETPOINT (compressor) only moves outside a WIDER
         # deadband [lo_sp, hi_sp] — sp_margin is learned. Fewer compressor moves.
+        #
+        # The deadband is what we agree *not* to correct, so it must never reach a
+        # safety rail — otherwise the learner can widen the optimizer straight into
+        # a guard trip. Each side is clamped by its own rail clearance, so a tight
+        # cold rail cannot throw away the warm-side lever (where this room lives).
         sp_margin = max(0.0, min(SP_MARGIN_CAP, m.sp_margin))
-        hi_sp = hi + sp_margin
-        lo_sp = lo - sp_margin
+        hi_sp = hi + _rail_limited(sp_margin, hi, p.hard_max)
+        lo_sp = lo - _rail_limited(sp_margin, lo, p.hard_min)
         y = s.comfort
         slope = s.slope if s.slope is not None else 0.0
         falling = slope <= -SLOPE_EPS
@@ -229,10 +244,17 @@ class Controller:
             elif settled <= hi and self.predictor.has_pending_cooling(s.now):
                 cmd.mode = MODE_COOLING
                 cmd.reason = (f"warm ({y:.2f}) but cooling in flight "
-                              f"({self.predictor.remaining_effect(s.now):+.2f}°C) → hold")
+                              f"({self.predictor.in_flight_effect(s.now):+.2f}°C) → hold")
             elif engaged and mins < self._step_dwell():
                 cmd.mode = MODE_COOLING
                 cmd.reason = f"warm ({y:.2f}), engaged, giving it time ({mins:.0f}/{self._step_dwell():.0f}m)"
+            elif mins < self._step_dwell():
+                # MIN_DWELL_FLOOR is a floor between setpoint commands, not a
+                # courtesy for engaged steps only: without this the branch below
+                # could stack a step every tick while power had yet to respond.
+                cmd.mode = MODE_COOLING
+                cmd.reason = (f"warm ({y:.2f}) → pacing the compressor "
+                              f"({mins:.1f}/{self._step_dwell():.0f}m since last step)")
             elif s.setpoint is not None and s.setpoint > p.setpoint_min:
                 self._command_setpoint(cmd, s, s.setpoint - 1)
                 cmd.mode = MODE_COOLING

@@ -185,6 +185,168 @@ def test_safety_unavailable_parks_at_floor():
     check(out.set_fan is False, "failsafe stops the fan")
 
 
+def test_pending_cooling_survives_stale_easing_steps():
+    # v3 bug: remaining_effect is a NET sum over ~55 min, so the easing steps that
+    # preceded a fresh cooling step cancelled it out and the controller concluded
+    # "no cooling in flight" 45 s after commanding cooling.
+    from comfort_zone.model import FopdtPredictor, ModelParams
+    m = ModelParams(dead_time_min=15.3, tau_min=8.0, gain_per_step=0.164)
+    p = FopdtPredictor(m)
+    p.record_setpoint_change(T0, -1)                            # 19:45 cool
+    p.record_setpoint_change(T0 + timedelta(minutes=29), +2)     # 20:14 ease
+    p.record_setpoint_change(T0 + timedelta(minutes=38), +1)     # 20:23 ease
+    p.record_setpoint_change(T0 + timedelta(minutes=48), -1)     # 20:33 cool
+    now = T0 + timedelta(minutes=48, seconds=45)                 # 20:34, 45 s later
+    check(p.has_pending_cooling(now),
+          f"a cooling step 45 s old must count as in flight (net remaining "
+          f"{p.remaining_effect(now):+.3f} is cancelled by stale easing steps)")
+
+
+def _live_v3_controller():
+    """The controller carrying the model the live system had learned by 07-25 22:00."""
+    c = fresh()
+    c.predictor.params.dead_time_min = 15.3
+    c.predictor.params.gain_per_step = 0.164
+    c.predictor.params.lead_min = 8.0     # was pinned at the old LEAD_CAP
+    c.predictor.params.sp_margin = 0.1
+    return c
+
+
+def test_anticipation_does_not_step_from_deep_inside_the_band():
+    # the real 20:33 trigger: comfort 25.97 with target 25.8 — only +0.17 over
+    # target, well inside the band — yet a saturated lead pushed the forecast
+    # 0.01 °C past the setpoint gate and moved the compressor.
+    c = _live_v3_controller()
+    p = params(target=25.8, band_low=0.4, band_high=0.65)
+    cmd = c.tick(sig(t=T0, comfort=25.97, slope=0.0738, power=736.0, setpoint=26), p)
+    check(cmd.set_setpoint is None,
+          f"must not move the compressor from inside the band, got {cmd.set_setpoint}: {cmd.reason}")
+
+
+def test_no_setpoint_double_step_within_dwell():
+    # a genuinely warm room may step — but not twice inside the dwell, which is
+    # how 26→25→24 happened in 45 s and drove a 1.1 °C dive into an overcool trip
+    c = _live_v3_controller()
+    p = params(target=25.8, band_low=0.4, band_high=0.65)
+    # stale easing steps still inside the ~55-min prediction horizon: these are
+    # what cancelled the fresh cooling step in the net-sum view
+    c.predictor.record_setpoint_change(T0 - timedelta(minutes=19), +2)
+    c.predictor.record_setpoint_change(T0 - timedelta(minutes=10), +1)
+    first = c.tick(sig(t=T0, comfort=26.70, slope=0.05, power=736.0, setpoint=26), p)
+    check(first.set_setpoint == 25, f"a warm room should step once, got {first.set_setpoint}")
+    second = c.tick(sig(t=T0 + timedelta(seconds=45), comfort=26.75, slope=0.05,
+                        power=736.0, setpoint=25), p)
+    check(second.set_setpoint is None,
+          f"must not step again 45 s later (dwell {c._step_dwell():.1f}m), got "
+          f"{second.set_setpoint}: {second.reason}")
+
+
+def test_lead_not_ratcheted_by_an_unpreventable_excursion():
+    # hot evening, compressor already on its floor: the room is out of band because
+    # the AC has nothing left to give. Anticipation could not have prevented it, so
+    # scoring it is what walked the lead to its cap.
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    kw = dict(target=25.8, band_low=0.4, band_high=0.65, hard_min=25.2, hard_max=27.5)
+    a = OnlineAdapter(ModelParams())
+    before = a.params.lead_min
+    a.observe(T0, 27.24, 0.0, saturated=True, **kw)                    # 0.79 over band
+    a.observe(T0 + timedelta(minutes=5), 26.0, 0.0, saturated=True, **kw)
+    check(a.params.lead_min == before,
+          f"a saturated excursion must not move the lead, {before}→{a.params.lead_min}")
+
+
+def test_gain_not_learned_from_saturated_episode():
+    # at the setpoint floor with the room still warm, cooling CANNOT move the room:
+    # that is actuator saturation, not a small plant gain — learning from it dragged
+    # gain to its floor and made the controller over-escalate later
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    m = ModelParams()
+    a = OnlineAdapter(m)
+    before = m.gain_per_step
+    a.on_setpoint_command(T0, delta_c=-1, comfort=27.2, at_floor=True)
+    a.observe(T0 + timedelta(minutes=40), comfort=27.25, slope=0.0)   # matured, no drop
+    check(m.gain_per_step == before,
+          f"a saturated episode must teach nothing about gain, {before}→{m.gain_per_step}")
+    # …but an unsaturated episode that genuinely failed to cool still shrinks gain
+    a.on_setpoint_command(T0 + timedelta(hours=2), delta_c=-1, comfort=27.2, at_floor=False)
+    a.observe(T0 + timedelta(hours=2, minutes=40), comfort=27.22, slope=0.0)
+    check(m.gain_per_step < before,
+          f"a clean no-response episode should still shrink gain, got {m.gain_per_step}")
+
+
+def test_lead_tolerance_is_tighter_on_the_cold_side():
+    # the cold rail sits ~0.2 °C under the band, the hot rail ~1.05 °C over it, so the
+    # same 0.2 °C excursion is "too deep" cold-side and fine warm-side
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    kw = dict(target=25.8, band_low=0.4, band_high=0.65, hard_min=25.2, hard_max=27.5)
+    a = OnlineAdapter(ModelParams())
+    lead0 = a.params.lead_min
+    a.observe(T0, 25.20, 0.0, **kw)                              # 0.2 below band
+    a.observe(T0 + timedelta(minutes=2), 25.8, 0.0, **kw)        # closed
+    check(a.params.lead_min > lead0, f"cold excursion of 0.2 must raise lead, got {a.params.lead_min}")
+    b = OnlineAdapter(ModelParams())
+    lead0 = b.params.lead_min
+    b.observe(T0, 26.65, 0.0, **kw)                              # the SAME 0.2, warm side
+    b.observe(T0 + timedelta(minutes=2), 25.8, 0.0, **kw)        # closed
+    check(b.params.lead_min <= lead0,
+          f"the same 0.2 excursion is tolerable on the warm side (rail is 1.05 away), "
+          f"must not raise lead, got {b.params.lead_min}")
+
+
+def test_lead_moves_both_ways():
+    # v3 pinned lead at LEAD_CAP because OVERSHOOT_TOL (0.15) was tighter than
+    # anything this room achieves, so the relax branch never fired. The learner
+    # must be able to walk back down, not just up.
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    from comfort_zone import const
+    kw = dict(target=25.8, band_low=0.4, band_high=0.65, hard_min=25.2, hard_max=27.5)
+    a = OnlineAdapter(ModelParams())
+    a.params.lead_min = const.LEAD_CAP            # start where v3 got stuck
+    t = T0
+    for _ in range(4):                             # excursions inside tolerance
+        a.observe(t, 26.60, 0.0, **kw)             # 0.15 over a 0.35 tolerance
+        a.observe(t + timedelta(minutes=2), 25.8, 0.0, **kw)
+        t += timedelta(minutes=20)
+    check(a.params.lead_min < const.LEAD_CAP - 1.0,
+          f"calm excursions must walk the lead back down from the cap, got {a.params.lead_min}")
+    down = a.params.lead_min
+    for _ in range(3):                             # now deep ones
+        a.observe(t, 27.30, 0.0, **kw)             # 0.85 over → severity-scaled
+        a.observe(t + timedelta(minutes=2), 25.8, 0.0, **kw)
+        t += timedelta(minutes=20)
+    check(a.params.lead_min > down,
+          f"deep excursions must raise it again, {down}→{a.params.lead_min}")
+
+
+def test_sp_margin_follows_the_cycling_rate():
+    # sp_margin is the anti-cycling knob, so it must be driven by observed compressor
+    # motion (its own feedback loop) — not by overshoot, which also drives lead and
+    # left the pair with no stable interior point.
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    a = OnlineAdapter(ModelParams())
+    a.observe(T0, 25.8, 0.0)                       # start observing
+    before = a.params.sp_margin
+    t = T0
+    for i in range(8):                             # 8 setpoint moves in an hour
+        t = T0 + timedelta(minutes=7 * (i + 1))
+        a.on_setpoint_command(t, delta_c=-1 if i % 2 else 1, comfort=26.0)
+        a.observe(t, 26.0, 0.0)
+    a.observe(T0 + timedelta(minutes=75), 26.0, 0.0)
+    check(a.params.sp_margin > before,
+          f"heavy cycling must widen the deadband, {before}→{a.params.sp_margin}")
+    # now go quiet for hours → tighten back to buy comfort
+    mid = a.params.sp_margin
+    for i in range(1, 12):
+        a.observe(T0 + timedelta(minutes=75 + 20 * i), 26.0, 0.0)
+    check(a.params.sp_margin < mid,
+          f"a quiet stretch must tighten the deadband, {mid}→{a.params.sp_margin}")
+
+
 def test_safety_overcool_releases_once_warm_again():
     # The reported bug: the guard tripped cold, the room warmed back well past
     # the release point, and the guard kept the AC off anyway (a hidden timer).
@@ -322,22 +484,22 @@ def test_midzone_uses_blower_not_setpoint():
     check(cmd.set_blower_idx == 1, f"mid-zone should raise the blower to 中, got {cmd.set_blower_idx}")
 
 
-def test_adapter_learns_sp_margin_from_cycling():
+def test_excursion_depth_only_tightens_sp_margin():
+    # sp_margin is no longer driven UP by calm excursions (that coupled it to the
+    # lead learner and left the pair with no interior fixed point) — the cycling
+    # rate widens it. A *deep* excursion is a comfort failure and still tightens it.
     from comfort_zone.adapt import OnlineAdapter
     from comfort_zone.model import ModelParams
     m = ModelParams()
     a = OnlineAdapter(m)
-    kw = dict(target=26.0, band_low=0.4, band_high=0.4)  # band top 26.4
+    kw = dict(target=26.0, band_low=0.4, band_high=0.4, hard_min=25.2, hard_max=27.5)
     before = m.sp_margin
-    # a small (within-tolerance) excursion then recovery → widen the deadband (fewer setpoint moves)
-    a.observe(T0, 26.5, 0.0, **kw)                       # 0.1 over → within tol
+    a.observe(T0, 26.5, 0.0, **kw)                        # 0.1 over → within tolerance
     a.observe(T0 + timedelta(minutes=2), 26.0, 0.0, **kw)
-    check(m.sp_margin > before, f"calm excursion should widen sp_margin, {before}→{m.sp_margin}")
-    # a big overshoot then recovery → tighten it back
-    mid = m.sp_margin
-    a.observe(T0 + timedelta(minutes=4), 27.2, 0.0, **kw)  # 0.8 over → over tol
+    check(m.sp_margin == before, f"a calm excursion must leave sp_margin alone, {before}→{m.sp_margin}")
+    a.observe(T0 + timedelta(minutes=4), 27.4, 0.0, **kw)  # 1.0 over → deep
     a.observe(T0 + timedelta(minutes=6), 26.0, 0.0, **kw)
-    check(m.sp_margin < mid, f"overshoot should tighten sp_margin, {mid}→{m.sp_margin}")
+    check(m.sp_margin < before, f"a deep excursion should tighten sp_margin, {before}→{m.sp_margin}")
 
 
 def test_adapter_learns_lead_from_overshoot():
@@ -351,11 +513,17 @@ def test_adapter_learns_lead_from_overshoot():
     before = m.lead_min
     a.observe(T0 + timedelta(minutes=2), 26.0, 0.0, **kw)
     check(m.lead_min > before, f"overshoot should raise lead, {before}→{m.lead_min}")
-    # a tiny overshoot (0.1 < tolerance) then recovers → lead relaxes (anti-cycle)
+    # an overshoot inside tolerance but not comfortably so → HOLD: this is the
+    # target, and without that hold zone the lead random-walks to a limit
     mid = m.lead_min
-    a.observe(T0 + timedelta(minutes=4), 26.5, 0.0, **kw)
-    a.observe(T0 + timedelta(minutes=6), 26.0, 0.0, **kw)
-    check(m.lead_min < mid, f"within-tolerance excursion should relax lead, {mid}→{m.lead_min}")
+    a.observe(T0 + timedelta(minutes=8), 26.5, 0.0, **kw)   # 0.10 over a 0.15 tolerance
+    a.observe(T0 + timedelta(minutes=10), 26.0, 0.0, **kw)
+    check(m.lead_min == mid, f"an on-target excursion should hold the lead, {mid}→{m.lead_min}")
+    # a comfortably-inside overshoot then recovers → lead relaxes (anti-cycle)
+    mid = m.lead_min
+    a.observe(T0 + timedelta(minutes=12), 26.43, 0.0, **kw)  # 0.03 over → well inside
+    a.observe(T0 + timedelta(minutes=14), 26.0, 0.0, **kw)
+    check(m.lead_min < mid, f"a comfortably-inside excursion should relax lead, {mid}→{m.lead_min}")
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

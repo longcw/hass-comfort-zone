@@ -123,6 +123,29 @@ Re-runnable service `comfort_zone.identify_model`: pulls recent recorder history
 fits FOPDT + power-lead + comfort params, writes constants into the zone's model
 store. Decision log persisted for a future heavier model.
 
+## Learning — online self-improve
+
+Two rules keep the online learner honest, both learned the hard way (v3 ran every
+knob to a limit):
+
+**Learn only from what you caused.** An episode teaches nothing about the plant
+gain when the setpoint was already on its floor (that is actuator *saturation*, not
+a small gain) or when the room warmed straight through it (the load moved). An
+*excursion* teaches nothing about the anticipation lead when the compressor was
+saturated throughout — no lead could have prevented it — nor when it was a
+sub-2-minute wobble across the band edge, which is sensor noise.
+
+**One signal per knob, and give each one a hold zone.** The anticipation `lead` and
+the setpoint deadband `sp_margin` trade against each other, so they must not be
+driven by the same signal: `lead` follows band-excursion depth, `sp_margin` follows
+the observed rate of compressor moves — the thing it exists to reduce, which closes
+a real loop (widening cuts the rate that caused the widening). Each has a
+no-adjustment band in the middle, so there is a fixed point to sit at instead of a
+random walk to a limit. Excursion tolerance is *derived per side* from the clearance
+between the band edge and that side's hard rail, so a rail 0.2 °C below the band is
+defended far harder than one 1 °C above it — and the learned deadband is clamped so
+it can never widen the optimizer into a guard trip.
+
 ## Repo layout
 
 ```

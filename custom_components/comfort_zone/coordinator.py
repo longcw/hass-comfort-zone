@@ -104,6 +104,8 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         self._adapter: OnlineAdapter | None = None
         self._comfort_hist: deque = deque(maxlen=64)
         self._power_hist: deque = deque(maxlen=256)
+        self._last_log_key: tuple | None = None
+        self._last_log_at = None
 
     # -- lifecycle ----------------------------------------------------------
     async def async_prepare(self) -> None:
@@ -237,6 +239,8 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             fan_max_level=int(opts[OPT_FAN_MAX_NIGHT] if is_night else opts[OPT_FAN_MAX_DAY]),
             managed_off_max_min=float(opts[OPT_MANAGED_OFF_MAX_MIN]),
             fan_assist_enabled=self.fan_assist,
+            hard_min=float(opts[OPT_HARD_MIN]),
+            hard_max=float(opts[OPT_HARD_MAX]),
         )
         signals = Signals(
             now=now, comfort=comfort, slope=slope, power=power, power_delta=power_delta,
@@ -288,7 +292,15 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("%s: failed to apply command: %s", self.zone_name, err)
 
-        if actions:
+        # A held override re-asserts the same command every tick (deliberately —
+        # the VRF is not trusted to keep it). Logging each re-assert made the
+        # decision log read as actuator churn that never happened, so collapse
+        # identical consecutive commands into one row (with a 5-min heartbeat).
+        repeat = (cmd.mode, tuple(actions)) == self._last_log_key and \
+            self._last_log_at is not None and (now - self._last_log_at) < timedelta(minutes=5)
+        if actions and not repeat:
+            self._last_log_key = (cmd.mode, tuple(actions))
+            self._last_log_at = now
             await self.store.append_log({
                 "t": now.isoformat(),
                 "mode": cmd.mode,
@@ -305,10 +317,16 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             if cmd.set_ac_power is False:
                 self._adapter.cancel()
             elif cmd.set_setpoint is not None and signals.setpoint is not None:
-                self._adapter.on_setpoint_command(now, cmd.set_setpoint - signals.setpoint, comfort)
+                self._adapter.on_setpoint_command(
+                    now, cmd.set_setpoint - signals.setpoint, comfort,
+                    at_floor=cmd.set_setpoint <= params.setpoint_min,
+                )
         else:
             self._adapter.cancel()
-        if self._adapter.observe(now, comfort, slope, target, band_low, band_high):
+        if self._adapter.observe(now, comfort, slope, target, band_low, band_high,
+                                 hard_min=sp.hard_min, hard_max=sp.hard_max,
+                                 saturated=(signals.setpoint is not None
+                                            and signals.setpoint <= params.setpoint_min)):
             await self.store.set_model(self._predictor.params.to_dict())
             _LOGGER.info("%s: adapted model → %s", self.zone_name, self._predictor.params.to_dict())
 

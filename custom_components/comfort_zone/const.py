@@ -76,7 +76,7 @@ MK_ENGAGE_WINDOW: Final = "engage_window_min"      # how long to wait for engage
 MK_LEAD: Final = "lead_min"                        # anticipation lead (LEARNED, bounded)
 MK_SP_MARGIN: Final = "sp_margin"                  # extra deadband beyond the comfort band before the SETPOINT moves (LEARNED)
 
-LEAD_CAP: Final = 8.0          # max anticipation lead the learner may reach (min)
+LEAD_CAP: Final = 5.0          # max anticipation lead the learner may reach (min)
 SP_MARGIN_CAP: Final = 0.6     # max setpoint deadband the learner may reach (°C)
 
 MODEL_DEFAULTS: Final = {

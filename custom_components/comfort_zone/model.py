@@ -127,9 +127,31 @@ class FopdtPredictor:
             total += s.delta_c * self.params.gain_per_step * unmaterialised
         return total
 
+    def in_flight_effect(self, now: datetime) -> float:
+        """°C still on the way from the most recently commanded *direction*.
+
+        ``remaining_effect`` is a net superposition over the whole horizon, which is
+        what "where does it settle" needs — but it is the wrong question for "should
+        I wait?". After a couple of easing steps their unmaterialised warming cancels
+        a fresh cooling step, so the net reads ≈0 and the controller concludes nothing
+        is in flight seconds after commanding it (that stacked 26→25→24 in 45 s).
+        Only the tail of same-direction steps describes what we just asked for.
+        """
+        self._prune(now)
+        if not self._steps:
+            return 0.0
+        cooling = self._steps[-1].delta_c < 0
+        total = 0.0
+        for s in reversed(self._steps):
+            if (s.delta_c < 0) != cooling:
+                break
+            elapsed = (now - s.at).total_seconds() / 60.0
+            total += s.delta_c * self.params.gain_per_step * (1.0 - self.response_fraction(elapsed))
+        return total
+
     def has_pending_cooling(self, now: datetime) -> bool:
         """True if a cooling step is engaged and still materialising."""
-        return self.remaining_effect(now) < -0.03
+        return self.in_flight_effect(now) < -0.03
 
     def predict_settled(self, now: datetime, y: float) -> float:
         """Where comfort_temp settles once in-flight steps play out."""
