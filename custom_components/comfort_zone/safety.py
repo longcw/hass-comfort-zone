@@ -9,7 +9,13 @@ Lessons from the prior 安全阈值 that oscillated are baked in:
 * trips on **wide absolute rails** (``hard_min`` / ``hard_max``), not on the
   narrow control band, so it stays a rare rail-safety and lets the optimizer do
   the normal holding;
-* a **cooldown** prevents re-tripping right after handing back;
+* **release is decided by the reading, never by a timer**: the moment the room is
+  back inside the rail (by ``RELEASE_HYST``) the optimizer gets the room back.
+  The only time gate is a short anti-short-cycle hold on the cold side, where we
+  actually cut power — and it is spelled out in the reason string;
+* a **cooldown** prevents re-tripping right after handing back — on the *cold*
+  side only, and only for shallow dips (``RETRIP_MARGIN``). Heat is the dangerous
+  direction, so overheat always trips the instant the rail is crossed;
 * overheat cools at the setpoint **floor** with the blower/fan maxed (no −3
   overshoot blast);
 * every override uses the **reliable power switch**, never HVAC-mode;
@@ -31,6 +37,8 @@ from .const import (
 from .controller import Command, Signals, ZoneParams
 
 RELEASE_HYST = 0.3        # °C back inside the rail before releasing
+MIN_OFF_MIN = 3.0         # min minutes the overcool guard keeps power off (compressor)
+RETRIP_MARGIN = 0.3       # °C past hard_min needed to re-trip overcool during the cooldown
 FAILSAFE_SETPOINT = 26    # parked setpoint when the sensor is truly gone
 
 STATE_NORMAL = "normal"
@@ -52,16 +60,23 @@ class SafetyGuard:
     def __init__(self) -> None:
         self.state: str = STATE_NORMAL
         self._since: datetime | None = None
+        self._overcool_released_at: datetime | None = None
 
     def _enter(self, state: str, now: datetime) -> None:
         if state != self.state:
             self.state = state
             self._since = now
 
-    def _cooldown_ok(self, now: datetime, cooldown_min: float) -> bool:
+    def _mins_in_state(self, now: datetime) -> float:
         if self._since is None:
-            return True
-        return (now - self._since).total_seconds() / 60.0 >= cooldown_min
+            return 1e9
+        return (now - self._since).total_seconds() / 60.0
+
+    def _in_overcool_cooldown(self, now: datetime, cooldown_min: float) -> bool:
+        """Did we hand back from an overcool trip very recently?"""
+        if self._overcool_released_at is None:
+            return False
+        return (now - self._overcool_released_at).total_seconds() / 60.0 < cooldown_min
 
     def evaluate(
         self,
@@ -109,29 +124,44 @@ class SafetyGuard:
         y = s.comfort
 
         # --- release logic (leave a protect state) -------------------------
+        # The reading decides, not a timer: as soon as the room is back inside the
+        # rail we hand the room back. Holding a protect state past that point is
+        # how a guard "gets stuck" — and on the hot side it force-cools straight
+        # through the band into an overcool.
         if self.state == STATE_OVERHEAT:
-            if y <= sp.hard_max - RELEASE_HYST and self._cooldown_ok(now, sp.cooldown_min):
+            if y <= sp.hard_max - RELEASE_HYST:
                 self._enter(STATE_NORMAL, now)
             else:
                 return self._overheat_cmd(s, p, y, sp)
         elif self.state == STATE_OVERCOOL:
-            if y >= sp.hard_min + RELEASE_HYST and self._cooldown_ok(now, sp.cooldown_min):
+            off_for = self._mins_in_state(now)
+            # the one time gate: we cut the power, so don't restart the
+            # compressor seconds later (and don't flap on sensor noise).
+            if y >= sp.hard_min + RELEASE_HYST and off_for >= MIN_OFF_MIN:
                 self._enter(STATE_NORMAL, now)
+                self._overcool_released_at = now
                 # hand back with the AC powered on so the optimizer can resume
                 if not s.ac_on and opt_cmd.set_ac_power is None:
                     opt_cmd.set_ac_power = True
             else:
-                return self._overcool_cmd(s, y, sp)
+                return self._overcool_cmd(s, y, sp, off_for)
         elif self.state in (STATE_FAILSAFE, STATE_STALE):
             self._enter(STATE_NORMAL, now)  # sensor came back / reports again
 
         # --- trip logic (enter a protect state) ----------------------------
+        # Heat trips on the rail, always, with no grace period.
         if y > sp.hard_max:
             self._enter(STATE_OVERHEAT, now)
             return self._overheat_cmd(s, p, y, sp)
-        if y < sp.hard_min:
+        # Cold: right after handing back, a shallow dip is not worth cutting the
+        # power again for (that flapping is what cooldown_min exists to stop);
+        # anything deeper than RETRIP_MARGIN still trips normally.
+        floor = sp.hard_min
+        if self._in_overcool_cooldown(now, sp.cooldown_min):
+            floor -= RETRIP_MARGIN
+        if y < floor:
             self._enter(STATE_OVERCOOL, now)
-            return self._overcool_cmd(s, y, sp)
+            return self._overcool_cmd(s, y, sp, 0.0)
 
         # normal — the optimizer is in charge
         return opt_cmd
@@ -154,13 +184,18 @@ class SafetyGuard:
             set_fan_level=p.fan_max_level,
         )
 
-    def _overcool_cmd(self, s: Signals, y: float, sp: SafetyParams) -> Command:
+    def _overcool_cmd(self, s: Signals, y: float, sp: SafetyParams,
+                      off_for: float) -> Command:
         release = sp.hard_min + RELEASE_HYST
-        reason = (
-            f"OVERCOOL guard: comfort {y:.2f} < hard_min {sp.hard_min:.1f} → AC off"
-            if y < sp.hard_min
-            else f"OVERCOOL guard: AC off, holding until comfort ≥ {release:.1f} (now {y:.2f})"
-        )
+        if y < sp.hard_min:
+            reason = f"OVERCOOL guard: comfort {y:.2f} < hard_min {sp.hard_min:.1f} → AC off"
+        elif y >= release:
+            # the reading already says release — say what we are actually waiting on
+            reason = (f"OVERCOOL guard: comfort {y:.2f} back above {release:.1f}, "
+                      f"AC off {off_for:.1f}/{MIN_OFF_MIN:.0f} min (compressor protection) "
+                      f"→ handing back next")
+        else:
+            reason = f"OVERCOOL guard: AC off, holding until comfort ≥ {release:.1f} (now {y:.2f})"
         return Command(
             mode=MODE_SAFETY_OVERCOOL,
             reason=reason,

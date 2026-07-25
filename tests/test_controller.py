@@ -185,6 +185,82 @@ def test_safety_unavailable_parks_at_floor():
     check(out.set_fan is False, "failsafe stops the fan")
 
 
+def test_safety_overcool_releases_once_warm_again():
+    # The reported bug: the guard tripped cold, the room warmed back well past
+    # the release point, and the guard kept the AC off anyway (a hidden timer).
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=29.0, cooldown_min=12)
+    p = params()
+    out = g.evaluate(sig(t=T0, comfort=24.9, ac_on=True), p, sp, Command())
+    check(out.mode == const.MODE_SAFETY_OVERCOOL, f"expected overcool trip, got {out.mode}")
+    check(out.set_ac_power is False, "overcool must cut AC power")
+    # 10 min later the room is at 26.19 — way above release (25.5): hand back NOW
+    t = T0 + timedelta(minutes=10)
+    opt = Command(mode=const.MODE_COOLING, reason="opt cooling", set_setpoint=25)
+    out = g.evaluate(sig(t=t, comfort=26.19, ac_on=False), p, sp, opt)
+    check(out.mode != const.MODE_SAFETY_OVERCOOL,
+          f"warm again ({26.19} ≥ 25.5) must release the guard, got {out.mode}: {out.reason}")
+    check(out.set_ac_power is True, f"hand back with the AC powered on, got {out.set_ac_power}")
+    check(g.state == "normal", f"guard should be back to normal, got {g.state}")
+
+
+def test_safety_overcool_short_hold_is_honest():
+    # A brief anti-short-cycle hold is fine, but the reason must say so instead
+    # of claiming it is waiting for a temperature it has already reached.
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=29.0, cooldown_min=12)
+    p = params()
+    g.evaluate(sig(t=T0, comfort=24.9), p, sp, Command())
+    out = g.evaluate(sig(t=T0 + timedelta(seconds=45), comfort=26.19, ac_on=False), p, sp, Command())
+    check(out.mode == const.MODE_SAFETY_OVERCOOL, "should still protect the compressor right after cutting power")
+    check("holding until" not in out.reason,
+          f"must not claim it is waiting for comfort ≥ 25.5 when comfort is 26.19: {out.reason}")
+    check("compressor" in out.reason, f"the reason must name the real hold: {out.reason}")
+
+
+def test_safety_overheat_releases_as_soon_as_back_under_rail():
+    # Holding "full cool at setpoint floor" after the room is back under the
+    # rail is what drives the overshoot into the opposite guard.
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
+    p = params()
+    out = g.evaluate(sig(t=T0, comfort=29.5), p, sp, Command())
+    check(out.mode == const.MODE_SAFETY_OVERHEAT, f"expected overheat trip, got {out.mode}")
+    t = T0 + timedelta(minutes=3)
+    opt = Command(mode=const.MODE_COOLING, reason="opt cooling")
+    out = g.evaluate(sig(t=t, comfort=28.5, setpoint=24), p, sp, opt)
+    check(out is opt, f"back under the rail (28.5 ≤ 28.7) must hand back at once, got {out.mode}: {out.reason}")
+
+
+def test_safety_overcool_retrip_needs_a_deeper_dip():
+    # After handing back, a hair below the rail must not immediately re-cut
+    # power (that is the flapping the cooldown exists to prevent) — but a real
+    # dip still trips.
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=29.0, cooldown_min=12)
+    p = params()
+    g.evaluate(sig(t=T0, comfort=24.9), p, sp, Command())
+    g.evaluate(sig(t=T0 + timedelta(minutes=6), comfort=25.6, ac_on=False), p, sp, Command())
+    check(g.state == "normal", f"should have released, got {g.state}")
+    t = T0 + timedelta(minutes=8)
+    out = g.evaluate(sig(t=t, comfort=25.15), p, sp, Command(mode=const.MODE_IDLE))
+    check(out.mode != const.MODE_SAFETY_OVERCOOL, f"0.05°C dip within cooldown should not re-trip, got {out.reason}")
+    out = g.evaluate(sig(t=t, comfort=24.8), p, sp, Command(mode=const.MODE_IDLE))
+    check(out.mode == const.MODE_SAFETY_OVERCOOL, f"a real dip must still trip, got {out.mode}")
+
+
+def test_safety_overheat_always_trips_immediately():
+    # The hot side gets no re-trip grace: heat is the dangerous direction.
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=23.0, hard_max=29.0, cooldown_min=12)
+    p = params()
+    g.evaluate(sig(t=T0, comfort=29.5), p, sp, Command())
+    g.evaluate(sig(t=T0 + timedelta(minutes=2), comfort=28.6), p, sp, Command())
+    check(g.state == "normal", f"should have released, got {g.state}")
+    out = g.evaluate(sig(t=T0 + timedelta(minutes=3), comfort=29.05), p, sp, Command())
+    check(out.mode == const.MODE_SAFETY_OVERHEAT, f"any excursion past hard_max must trip, got {out.mode}")
+
+
 def test_fan_disabled_never_runs_fan():
     c = fresh()
     p = params()

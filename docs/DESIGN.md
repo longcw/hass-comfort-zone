@@ -96,8 +96,13 @@ Named presets bundling tunables + emphasis: **Baby/Quiet**, **Eco**, **Comfort**
 
 ## Safety layer (always-on, independent of the optimizer)
 
-Absolute hard `comfort_temp` min/max clamps (wide margin + cooldown, lessons from
-the prior 安全阈值 oscillation baked in); managed AC-off always has a watchdog
+Absolute hard `comfort_temp` min/max clamps (wide margin, lessons from the prior
+安全阈值 oscillation baked in). A guard state is **left on the reading, never on a
+timer** — back inside the rail by the release hysteresis and the optimizer has the
+room again; the only time gate is a short anti-short-cycle hold on the cold side
+(where power was cut), and the cooldown merely stops a *shallow* re-trip right
+after handing back (cold side only — heat always trips at once).
+Managed AC-off always has a watchdog
 return (max-duration or comfort-rise → power back on via the **reliable power
 switch**, never HVAC-mode); stale/unavailable sensor → stop actuating and revert
 AC to a safe fixed setpoint.
