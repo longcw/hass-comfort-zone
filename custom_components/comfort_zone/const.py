@@ -74,8 +74,10 @@ MK_POWER_LEAD: Final = "power_lead_min"            # power leads comfort slope b
 MK_ENGAGE_WATTS: Final = "engage_watts"            # Δpower that counts as "engaged"
 MK_ENGAGE_WINDOW: Final = "engage_window_min"      # how long to wait for engagement
 MK_LEAD: Final = "lead_min"                        # anticipation lead (LEARNED, bounded)
+MK_SP_MARGIN: Final = "sp_margin"                  # extra deadband beyond the comfort band before the SETPOINT moves (LEARNED)
 
 LEAD_CAP: Final = 8.0          # max anticipation lead the learner may reach (min)
+SP_MARGIN_CAP: Final = 0.6     # max setpoint deadband the learner may reach (°C)
 
 MODEL_DEFAULTS: Final = {
     MK_DEAD_TIME: 10.0,
@@ -85,6 +87,7 @@ MODEL_DEFAULTS: Final = {
     MK_ENGAGE_WATTS: 150.0,
     MK_ENGAGE_WINDOW: 4.0,
     MK_LEAD: 3.0,           # start with a little anticipation; the adapter tunes it
+    MK_SP_MARGIN: 0.25,     # start with a small setpoint deadband; the adapter tunes it
 }
 
 # ---------------------------------------------------------------------------

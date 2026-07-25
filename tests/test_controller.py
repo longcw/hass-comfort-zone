@@ -63,12 +63,12 @@ def test_asymmetric_band():
     # target 25.7, low 0.4 (→25.3), high 0.7 (→26.4): 26.3 is still IN band,
     # but 25.2 is cold. Warm side tolerates more than cold side.
     c = fresh()
-    p = params(target=25.7, band_low=0.4, band_high=0.7)
+    p = params(target=25.7, band_low=0.4, band_high=0.7)  # comfort [25.3,26.4]; +sp_margin 0.25 → setpoint gate [25.05,26.65]
     cmd = c.tick(sig(comfort=26.3, setpoint=25, slope=0.0), p)
-    check(cmd.set_setpoint is None, f"26.3 within [25.3,26.4] must not cool, got {cmd.set_setpoint}")
+    check(cmd.set_setpoint is None, f"26.3 within the warm side must not cool, got {cmd.set_setpoint}")
     c2 = fresh()
-    cmd2 = c2.tick(sig(comfort=25.2, setpoint=25, fan_on=False, slope=0.0), p)
-    check(cmd2.mode == const.MODE_EASING, f"25.2 below low bound should ease, got {cmd2.mode}")
+    cmd2 = c2.tick(sig(comfort=24.9, setpoint=25, fan_on=False, slope=0.0), p)  # below lo_sp 25.05
+    check(cmd2.mode == const.MODE_EASING, f"24.9 below the setpoint band should ease, got {cmd2.mode}")
 
 
 def test_blower_drops_to_low_at_or_below_target():
@@ -135,7 +135,7 @@ def test_not_engaged_escalates():
 
 def test_cold_eases_fan_first():
     c = fresh()
-    cmd = c.tick(sig(comfort=25.4, setpoint=25, fan_on=True, fan_level=30), params())
+    cmd = c.tick(sig(comfort=25.0, setpoint=25, fan_on=True, fan_level=30), params())  # below lo_sp 25.35
     check(cmd.set_fan is False, "cold should ease the fan off first")
     check(cmd.set_setpoint is None, "cold should not raise setpoint while fan still on")
     check(cmd.mode == const.MODE_EASING, f"expected easing, got {cmd.mode}")
@@ -223,8 +223,8 @@ def test_safety_normal_passthrough():
 def test_anticipation_pre_cools():
     # in-band (26.2) but rising; with the default lead the forecast crosses the
     # band top → start cooling early instead of waiting for the overshoot
-    c = fresh()
-    cmd = c.tick(sig(comfort=26.2, slope=0.1, setpoint=26), params())
+    c = fresh()  # in comfort band (26.3<hi 26.4) but rising hard → y_ahead crosses the wider setpoint gate 26.65
+    cmd = c.tick(sig(comfort=26.3, slope=0.2, setpoint=26), params())
     check(cmd.set_setpoint == 25, f"anticipated warm should pre-cool to 25, got {cmd.set_setpoint}")
 
 
@@ -235,6 +235,33 @@ def test_in_band_return_to_neutral():
     cmd = c.tick(sig(comfort=25.8, slope=-0.03, setpoint=24), params(target=26.0))
     check(cmd.set_setpoint == 25, f"return-to-neutral should raise setpoint to 25, got {cmd.set_setpoint}")
     check(cmd.mode == const.MODE_EASING, f"expected easing, got {cmd.mode}")
+
+
+def test_midzone_uses_blower_not_setpoint():
+    # warm into the mid-zone (above comfort band 26.4 but below setpoint gate 26.65):
+    # the blower does the work, the compressor setpoint stays put
+    c = fresh()
+    cmd = c.tick(sig(comfort=26.5, slope=0.0, setpoint=26, blower_idx=0), params())
+    check(cmd.set_setpoint is None, f"mid-zone must NOT move the setpoint, got {cmd.set_setpoint}")
+    check(cmd.set_blower_idx == 1, f"mid-zone should raise the blower to 中, got {cmd.set_blower_idx}")
+
+
+def test_adapter_learns_sp_margin_from_cycling():
+    from comfort_zone.adapt import OnlineAdapter
+    from comfort_zone.model import ModelParams
+    m = ModelParams()
+    a = OnlineAdapter(m)
+    kw = dict(target=26.0, band_low=0.4, band_high=0.4)  # band top 26.4
+    before = m.sp_margin
+    # a small (within-tolerance) excursion then recovery → widen the deadband (fewer setpoint moves)
+    a.observe(T0, 26.5, 0.0, **kw)                       # 0.1 over → within tol
+    a.observe(T0 + timedelta(minutes=2), 26.0, 0.0, **kw)
+    check(m.sp_margin > before, f"calm excursion should widen sp_margin, {before}→{m.sp_margin}")
+    # a big overshoot then recovery → tighten it back
+    mid = m.sp_margin
+    a.observe(T0 + timedelta(minutes=4), 27.2, 0.0, **kw)  # 0.8 over → over tol
+    a.observe(T0 + timedelta(minutes=6), 26.0, 0.0, **kw)
+    check(m.sp_margin < mid, f"overshoot should tighten sp_margin, {mid}→{m.sp_margin}")
 
 
 def test_adapter_learns_lead_from_overshoot():

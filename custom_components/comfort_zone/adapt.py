@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from .const import LEAD_CAP
+from .const import LEAD_CAP, SP_MARGIN_CAP
 from .model import ModelParams
 
 ALPHA = 0.3                 # EMA weight on the newest observation (fast)
@@ -36,6 +36,10 @@ SLOPE_EPS = 0.02
 OVERSHOOT_TOL = 0.15        # °C of overshoot beyond the band we'll tolerate
 LEAD_UP = 1.0              # minutes added per over-tolerance excursion (×severity)
 LEAD_DOWN = 0.4           # minutes relaxed per within-tolerance excursion (anti-cycle)
+# Setpoint deadband — the cycling knob. Widen it when excursions stay small (the
+# compressor moves less); tighten it (safety-biased: faster) when we overshoot.
+SP_MARGIN_UP = 0.05        # °C widened per within-tolerance excursion (fewer setpoint moves)
+SP_MARGIN_DOWN = 0.10     # °C tightened per over-tolerance excursion (tighter control)
 
 
 @dataclass
@@ -101,13 +105,18 @@ class OnlineAdapter:
         if self._exc_side is None:
             return False
         peak, self._exc_side, self._exc_peak = self._exc_peak, None, 0.0
-        old = self.params.lead_min
+        old_lead, old_spm = self.params.lead_min, self.params.sp_margin
         if peak > OVERSHOOT_TOL:
-            self.params.lead_min = min(LEAD_CAP, old + LEAD_UP * min(2.0, peak / OVERSHOOT_TOL))
+            # overshot → anticipate more AND tighten the setpoint deadband
+            self.params.lead_min = min(LEAD_CAP, old_lead + LEAD_UP * min(2.0, peak / OVERSHOOT_TOL))
+            self.params.sp_margin = max(0.0, old_spm - SP_MARGIN_DOWN)
         else:
-            self.params.lead_min = max(0.0, old - LEAD_DOWN)
+            # stayed in check → relax anticipation AND widen the deadband (less cycling)
+            self.params.lead_min = max(0.0, old_lead - LEAD_DOWN)
+            self.params.sp_margin = min(SP_MARGIN_CAP, old_spm + SP_MARGIN_UP)
         self.params.lead_min = round(self.params.lead_min, 2)
-        return self.params.lead_min != old
+        self.params.sp_margin = round(self.params.sp_margin, 3)
+        return self.params.lead_min != old_lead or self.params.sp_margin != old_spm
 
     def _advance_episode(self, now: datetime, comfort: float | None, slope: float | None) -> bool:
         """Advance the active cooling episode (gain / dead-time). True if changed."""

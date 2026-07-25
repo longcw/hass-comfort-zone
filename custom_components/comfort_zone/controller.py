@@ -38,7 +38,7 @@ from .const import (
     MODE_IDLE,
     MODE_MANAGED_OFF,
 )
-from .const import LEAD_CAP
+from .const import LEAD_CAP, SP_MARGIN_CAP
 from .model import FopdtPredictor
 
 ANTICIP_CAP = 0.6         # °C — max shift the anticipation lead may apply
@@ -46,7 +46,7 @@ SLOPE_EPS = 0.02          # °C/min considered "flat"
 FAN_HYST = 0.1            # °C hysteresis around target for fan on/off
 FAN_SPAN = 2.0           # °C above target at which the fan reaches its cap
 FF_NUDGE = 0.3           # °C the power feedforward shifts the effective temp
-MIN_DWELL_FLOOR = 3.0    # minutes; hard floor between setpoint commands
+MIN_DWELL_FLOOR = 6.0    # minutes; hard floor between setpoint commands (pace the compressor)
 BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
 
 
@@ -105,7 +105,7 @@ class Controller:
 
     # -- helpers ------------------------------------------------------------
     def _step_dwell(self) -> float:
-        return max(MIN_DWELL_FLOOR, self.predictor.params.dead_time_min * 0.5)
+        return max(MIN_DWELL_FLOOR, self.predictor.params.dead_time_min * 0.6)
 
     def _mins_since_cmd(self, now: datetime) -> float:
         if self._last_cmd_at is None:
@@ -127,23 +127,22 @@ class Controller:
 
     def _manage_blower(self, cmd: Command, s: Signals, p: ZoneParams,
                        y: float, hi: float, falling: bool) -> None:
-        """Track blower to cooling demand, one level per dwell.
-
-        低风 (quiet, least draft) whenever comfort is at/below target; 中风 only
-        when warm AND the setpoint is already floored (needs more cold air);
-        left as-is in the warm-but-not-floored middle (no flapping). 高风 is
-        reserved for the safety guard.
+        """The AC blower is the MID-ZONE lever — cheaper than a setpoint change
+        (it modulates cold-air delivery without cycling the compressor). So it's
+        the first AC response to warmth: 中风 whenever comfort is above the comfort
+        band (the mid-zone, before the setpoint moves at the wider edge); 低风
+        (quiet, least draft) at/below target; held in between. 高风 is reserved
+        for the safety guard.
         """
         if not p.blower_levels or cmd.set_blower_idx is not None:
             return
         cur = s.blower_idx if s.blower_idx is not None else 0
-        cooling_hard = y > hi and s.setpoint is not None and s.setpoint <= p.setpoint_min and not falling
-        if cooling_hard:
-            desired = p.regular_blower_max
+        if y > hi and not falling:
+            desired = p.regular_blower_max   # warm beyond the comfort band → more airflow
         elif y <= p.target:
             desired = 0
         else:
-            return  # warm but not floored → leave the blower where it is
+            return  # warm-but-within-band → leave the blower where it is
         if desired == cur:
             return
         if self._last_blower_at is not None and \
@@ -168,6 +167,12 @@ class Controller:
         m = self.predictor.params
         hi = p.target + p.band_high
         lo = p.target - p.band_low
+        # Cost-split: the fan works the comfort band [lo,hi]; the AC blower works
+        # the mid-zone; the SETPOINT (compressor) only moves outside a WIDER
+        # deadband [lo_sp, hi_sp] — sp_margin is learned. Fewer compressor moves.
+        sp_margin = max(0.0, min(SP_MARGIN_CAP, m.sp_margin))
+        hi_sp = hi + sp_margin
+        lo_sp = lo - sp_margin
         y = s.comfort
         slope = s.slope if s.slope is not None else 0.0
         falling = slope <= -SLOPE_EPS
@@ -202,8 +207,8 @@ class Controller:
             self._fan_layer(cmd, s, p, trend, cooling_incoming, warming_incoming)
             return cmd
 
-        # === 2. WARM ========================================================
-        if settled > hi or y > hi or y_ahead > hi:
+        # === 2. WARM (setpoint acts only beyond the wider deadband) =========
+        if settled > hi_sp or y > hi_sp or y_ahead > hi_sp:
             recent_cool = self._last_cmd_cooling and mins <= (m.dead_time_min + m.tau_min)
             not_engaged = recent_cool and not engaged
 
@@ -236,8 +241,8 @@ class Controller:
                 cmd.mode = MODE_COOLING
                 cmd.reason = f"warm ({y:.2f}) at setpoint floor → holding (blower/fan carry)"
 
-        # === 3. COLD ========================================================
-        elif settled < lo or y < lo or y_ahead < lo:
+        # === 3. COLD (setpoint acts only beyond the wider deadband) =========
+        elif settled < lo_sp or y < lo_sp or y_ahead < lo_sp:
             if rising:
                 cmd.mode = MODE_EASING
                 cmd.reason = f"cold ({y:.2f}) but rising ({slope:+.3f}) → warming back, hold"
@@ -257,26 +262,28 @@ class Controller:
                 cmd.mode = MODE_EASING
                 cmd.reason = f"cold ({y:.2f}) → hold"
 
-        # === 4. In band ====================================================
+        # === 4. In the deadband — fan/blower only, no setpoint churn ========
         else:
-            # Return-to-neutral: below target and still falling on a low (cooling)
-            # setpoint → ease the setpoint up now instead of sitting parked on a
-            # cooling setpoint and slowly drifting into an overcool.
-            if (y <= p.target and falling and s.ac_on and s.setpoint is not None
-                    and s.setpoint < p.setpoint_max and mins >= self._step_dwell()):
+            # Return-to-neutral, PACED and CAPPED: if we're below target and still
+            # falling on a setpoint that's below neutral (round target), ease it up
+            # one step toward neutral — undoes a deep cooling escalation without
+            # ping-ponging (it never raises above neutral, and it's slow-paced).
+            neutral = round(p.target)
+            if (y < p.target and falling and s.ac_on and s.setpoint is not None
+                    and s.setpoint < neutral and mins >= self._step_dwell() * 1.5):
                 self._command_setpoint(cmd, s, s.setpoint + 1)
                 cmd.mode = MODE_EASING
-                cmd.reason = f"in-band below target & falling → setpoint {cmd.set_setpoint} (return to neutral)"
+                cmd.reason = f"below target & falling on a low setpoint → ease to {cmd.set_setpoint} (toward neutral {neutral})"
             else:
                 cmd.mode = MODE_IDLE
-                cmd.reason = f"on target ({y:.2f} in [{lo:.2f},{hi:.2f}])"
+                cmd.reason = f"in deadband ({y:.2f}, setpoint band [{lo_sp:.2f},{hi_sp:.2f}]) — fan/blower only"
 
         # note when the trigger was the anticipation lead, not the reading itself
-        if lo <= y <= hi and lo <= settled <= hi and (y_ahead > hi or y_ahead < lo) \
+        if lo_sp <= y <= hi_sp and lo_sp <= settled <= hi_sp and (y_ahead > hi_sp or y_ahead < lo_sp) \
                 and cmd.mode in (MODE_COOLING, MODE_EASING):
             cmd.reason = f"anticipating ({y_ahead:.2f}) — {cmd.reason}"
 
-        # === 5. AC blower + fan comfort layer ==============================
+        # === 5. AC blower (mid-zone lever) + fan comfort layer ==============
         self._manage_blower(cmd, s, p, y, hi, falling)
         self._fan_layer(cmd, s, p, trend, cooling_incoming, warming_incoming)
         if cmd.mode == MODE_IDLE and (cmd.set_fan or cmd.set_fan_level is not None):
