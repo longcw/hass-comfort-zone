@@ -207,6 +207,55 @@ def test_pending_cooling_survives_stale_easing_steps():
           f"{p.remaining_effect(now):+.3f} is cancelled by stale easing steps)")
 
 
+def test_power_trend_ignores_the_duty_cycle():
+    # The fan feedforward asks "is more cooling arriving?". Point-sampling that on a
+    # duty-cycled load made a normal 2-5 min off-phase look like the AC backing off,
+    # so the fan sped up for no reason — 14 hard sign flips across one night.
+    from comfort_zone.model import power_trend
+    hist = []
+    t = T0
+    for _cycle in range(8):                    # steady output: 6 min on, 3 min off
+        for _ in range(8):
+            hist.append((t, 650.0))
+            t += timedelta(seconds=45)
+        for _ in range(4):
+            hist.append((t, 2.0))
+            t += timedelta(seconds=45)
+    from comfort_zone.controller import FF_TRIGGER_MULT
+    trigger = 150.0 * FF_TRIGGER_MULT      # engage_watts default × the fan's multiplier
+    worst = 0.0
+    for i in range(40, len(hist)):
+        d = power_trend(hist[:i], hist[i - 1][0], 12.0)
+        if d is not None:
+            worst = max(worst, abs(d))
+    check(worst < trigger,
+          f"steady duty-cycled output must not reach the fan's feedforward trigger "
+          f"({trigger:.0f} W), worst |Δ| = {worst:.0f} W")
+
+
+def test_power_trend_still_sees_a_real_ramp():
+    from comfort_zone.model import power_trend
+    hist = []
+    t = T0
+    for _ in range(20):                        # baseline
+        hist.append((t, 650.0))
+        t += timedelta(seconds=45)
+    for _ in range(20):                        # unit ramps up and stays there
+        hist.append((t, 1300.0))
+        t += timedelta(seconds=45)
+    from comfort_zone.controller import FF_TRIGGER_MULT
+    d = power_trend(hist, hist[-1][0], 12.0)
+    check(d is not None and d > 150.0 * FF_TRIGGER_MULT,
+          f"a sustained +650 W ramp must clear the feedforward trigger, got {d}")
+
+
+def test_power_trend_unknown_without_history():
+    from comfort_zone.model import power_trend
+    check(power_trend([], T0, 12.0) is None, "no history → unknown, not zero")
+    thin = [(T0, 700.0), (T0 + timedelta(seconds=45), 700.0)]
+    check(power_trend(thin, thin[-1][0], 12.0) is None, "too little history → unknown")
+
+
 def test_off_phase_must_not_read_as_a_failed_command():
     # Measured: this VRF duty-cycles ~18 min on / 2-5 min off. Four minutes after a
     # step, "no power rise" is a normal off phase — and with a 17-min dead time the

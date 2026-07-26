@@ -56,7 +56,7 @@ from .const import (
     UNAVAILABLE_STATES,
 )
 from .controller import Controller, Signals, ZoneParams
-from .model import FopdtPredictor, ModelParams
+from .model import FopdtPredictor, ModelParams, power_trend
 from .safety import SafetyGuard, SafetyParams
 from .store import ZoneStore
 
@@ -68,6 +68,10 @@ SLOPE_WINDOW_MIN = 5.0
 # enough to tolerate normal BLE gaps (the crib thermometer can go quiet ~10 min);
 # a value present but merely quiet only freezes control, it does not disrupt.
 STALE_AFTER_S = 1200
+# The fan's power feedforward averages over this many power-lead windows (see
+# power_trend): wide enough that the unit's 2–5 min off-phases do not read as the
+# AC backing off, which used to flip the fan's nudge across its threshold.
+POWER_TREND_WINDOWS = 2.0
 
 
 def _report_age(state, now) -> float:
@@ -180,12 +184,14 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         return (v1 - v0) / dt if dt > 0 else 0.0
 
     def _power_delta(self, power: float | None, now, lead_min: float) -> float | None:
-        if power is None:
-            return None
-        self._power_hist.append((now, power))
-        cutoff = now - timedelta(minutes=lead_min)
-        past = [v for (t, v) in self._power_hist if t <= cutoff]
-        return power - past[-1] if past else 0.0
+        """Lead signal for the fan layer: is delivered AC power rising or falling?
+
+        Window-averaged (see :func:`power_trend`) — a point-to-point difference reads
+        the unit's own off-phases as the AC backing off.
+        """
+        if power is not None:
+            self._power_hist.append((now, power))
+        return power_trend(self._power_hist, now, lead_min * POWER_TREND_WINDOWS)
 
     # -- the tick -----------------------------------------------------------
     async def _async_update_data(self) -> dict[str, Any]:

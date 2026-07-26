@@ -56,6 +56,11 @@ SLOPE_EPS = 0.02          # °C/min considered "flat"
 FAN_HYST = 0.1            # °C hysteresis around target for fan on/off
 FAN_SPAN = 2.0           # °C above target at which the fan reaches its cap
 FF_NUDGE = 0.3           # °C the power feedforward shifts the effective temp
+FF_TRIGGER_MULT = 2.5    # × engage_watts before the feedforward nudges the fan.
+#                          engage_watts is calibrated for a STEP at a known moment;
+#                          this signal is a 12-min mean of a duty-cycled load, whose
+#                          residual duty artifact is itself ~150 W. Real ramps measure
+#                          +450…+650 W, so demand that much before biasing the fan.
 MIN_DWELL_FLOOR = 6.0    # minutes; hard floor between setpoint commands (pace the compressor)
 BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
 RAIL_KEEPOUT = 0.4       # °C of the band→rail clearance the deadband may never use
@@ -77,7 +82,7 @@ class Signals:
     comfort: float | None
     slope: float | None            # °C/min
     power: float | None            # W (whole-system)
-    power_delta: float | None      # W change over ~power_lead window
+    power_delta: float | None      # W change in window-MEAN power (see model.power_trend)
     ac_on: bool = False
     setpoint: int | None = None
     blower_idx: int | None = None  # index into blower_levels; None = auto/unknown
@@ -264,8 +269,9 @@ class Controller:
         # lead. y_ahead crosses the band before y does, so we start/ease earlier.
         lead = max(0.0, min(LEAD_CAP, m.lead_min))
         y_ahead = y + max(-ANTICIP_CAP, min(ANTICIP_CAP, slope * lead))
-        cooling_incoming = s.power_delta is not None and s.power_delta > m.engage_watts
-        warming_incoming = s.power_delta is not None and s.power_delta < -m.engage_watts
+        ff_trigger = m.engage_watts * FF_TRIGGER_MULT
+        cooling_incoming = s.power_delta is not None and s.power_delta > ff_trigger
+        warming_incoming = s.power_delta is not None and s.power_delta < -ff_trigger
         mins = self._mins_since_cmd(s.now)
         engaged = falling or self._power_engaged()
 

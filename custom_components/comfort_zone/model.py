@@ -51,6 +51,34 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+POWER_TREND_MIN_SAMPLES = 3
+
+
+def power_trend(history, now: datetime, window_min: float) -> float | None:
+    """Change in delivered AC power: mean over a window vs the preceding one.
+
+    ``history`` is an iterable of ``(timestamp, watts)``. Returns None when either
+    window is too thin to judge.
+
+    Deliberately a **mean over a window**, not "now minus then". The unit
+    duty-cycles (measured: ~18 min on, 2–5 min off), so a point-to-point difference
+    straddles on/off boundaries and swings ±650 W with no change in delivered
+    cooling — on one measured night that flipped the fan's feedforward across its
+    threshold 14 times. A mean captures what actually matters (modulation level *and*
+    the fraction of time running) and, over a window of ~2× the power lead, produced
+    zero such flips on the same data.
+    """
+    pts = [(t, v) for (t, v) in history if v is not None]
+    if not pts:
+        return None
+    w = timedelta(minutes=window_min)
+    recent = [v for (t, v) in pts if now - w <= t <= now]
+    prior = [v for (t, v) in pts if now - 2 * w <= t < now - w]
+    if len(recent) < POWER_TREND_MIN_SAMPLES or len(prior) < POWER_TREND_MIN_SAMPLES:
+        return None
+    return sum(recent) / len(recent) - sum(prior) / len(prior)
+
+
 @dataclass
 class ModelParams:
     dead_time_min: float = MODEL_DEFAULTS[MK_DEAD_TIME]
