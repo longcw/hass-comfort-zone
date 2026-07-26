@@ -213,6 +213,13 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             if fm in blower_levels:
                 blower_idx = blower_levels.index(fm)
 
+        device_min = 16
+        if climate_st and climate_st.attributes.get("min_temp") is not None:
+            try:
+                device_min = int(round(float(climate_st.attributes["min_temp"])))
+            except (TypeError, ValueError):
+                pass
+
         fan_on = False
         fan_level = None
         if d.get(CONF_FAN):
@@ -241,6 +248,7 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             fan_assist_enabled=self.fan_assist,
             hard_min=float(opts[OPT_HARD_MIN]),
             hard_max=float(opts[OPT_HARD_MAX]),
+            setpoint_device_min=device_min,
         )
         signals = Signals(
             now=now, comfort=comfort, slope=slope, power=power, power_delta=power_delta,

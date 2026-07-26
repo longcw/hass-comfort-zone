@@ -122,13 +122,18 @@ def test_engaged_cooling_is_patient_no_churn():
 
 
 def test_not_engaged_escalates():
-    """If the AC ignores the command (power flat, slope flat), escalate fast."""
+    """If the AC ignores the command (power flat, slope flat), escalate.
+
+    Paced by physics, not by the 4-min power window: a duty-cycling unit shows no
+    power rise for minutes at a time, so the window must outlast its off phase
+    (dead_time × 0.8 — 8 min on the default model).
+    """
     c = fresh()
     p = params()
     cmd = c.tick(sig(t=T0, comfort=27.2, setpoint=26, power=800.0), p)
     check(cmd.set_setpoint == 25, "first step to 25")
-    # +5 min, power unchanged, slope flat → not engaged past window(4m) → escalate
-    t2 = T0 + timedelta(minutes=5)
+    # +9 min, power unchanged, slope flat → past the dead-time window → escalate
+    t2 = T0 + timedelta(minutes=9)
     cmd = c.tick(sig(t=t2, comfort=27.2, setpoint=25, power=800.0, power_delta=0.0, slope=0.0), p)
     check(cmd.set_setpoint == 24, f"non-engagement should escalate 25→24, got {cmd.set_setpoint}")
 
@@ -160,7 +165,7 @@ def test_safety_overheat_overrides():
     opt = Command(mode=const.MODE_IDLE, reason="opt idle")
     out = g.evaluate(sig(comfort=29.5, setpoint=26), params(), sp, opt)
     check(out.mode == const.MODE_SAFETY_OVERHEAT, f"expected overheat, got {out.mode}")
-    check(out.set_setpoint == 24, "overheat cools at setpoint floor")
+    check(out.set_setpoint == 22, f"overheat blasts 2 below the setpoint floor, got {out.set_setpoint}")
     check(out.set_ac_power is True and out.set_fan is True, "overheat forces AC+fan on")
 
 
@@ -200,6 +205,94 @@ def test_pending_cooling_survives_stale_easing_steps():
     check(p.has_pending_cooling(now),
           f"a cooling step 45 s old must count as in flight (net remaining "
           f"{p.remaining_effect(now):+.3f} is cancelled by stale easing steps)")
+
+
+def test_off_phase_must_not_read_as_a_failed_command():
+    # Measured: this VRF duty-cycles ~18 min on / 2-5 min off. Four minutes after a
+    # step, "no power rise" is a normal off phase — and with a 17-min dead time the
+    # slope cannot have answered either. v3.1 called that "not engaged" and escalated
+    # after nearly every step, which is what drove the 15-min limit cycle.
+    c = fresh()
+    c.predictor.params.dead_time_min = 17.0
+    p = params(target=26.1, band_low=0.4, band_high=0.65)
+    first = c.tick(sig(t=T0, comfort=26.9, slope=0.03, power=670.0, setpoint=26), p)
+    check(first.set_setpoint == 25, f"warm room should step, got {first.set_setpoint}")
+    out = c.tick(sig(t=T0 + timedelta(minutes=4, seconds=30), comfort=26.95, slope=0.03,
+                     power=2.0, setpoint=25), p)   # compressor in an off phase
+    check(out.set_setpoint is None,
+          f"an off-phase 4.5 min in must not escalate (window is dead-time paced), "
+          f"got {out.set_setpoint}: {out.reason}")
+
+
+def test_a_genuinely_dead_command_still_escalates():
+    # The escape hatch survives, just paced by physics: once the dead-time window has
+    # passed with no power rise and no slope, the command really didn't take.
+    c = fresh()
+    c.predictor.params.dead_time_min = 17.0
+    p = params(target=26.1, band_low=0.4, band_high=0.65)
+    c.tick(sig(t=T0, comfort=26.9, slope=0.03, power=670.0, setpoint=26), p)
+    out = c.tick(sig(t=T0 + timedelta(minutes=14), comfort=27.0, slope=0.03,
+                     power=670.0, setpoint=25), p)
+    check(out.set_setpoint == 24,
+          f"after the dead-time window a flat response should escalate, "
+          f"got {out.set_setpoint}: {out.reason}")
+
+
+def test_warm_side_setpoint_acts_at_the_band_edge():
+    # v3.1 let the learned deadband widen the warm gate to 27.25 with the rail at
+    # 27.5, so the room was allowed to sit warm. Comfort first: on the warm side the
+    # setpoint acts at the band edge, whatever the learner has decided.
+    c = fresh()
+    c.predictor.params.sp_margin = 0.45
+    p = params(target=26.1, band_low=0.4, band_high=0.65)   # band top 26.75
+    cmd = c.tick(sig(t=T0, comfort=26.80, slope=0.02, power=700.0, setpoint=26), p)
+    check(cmd.set_setpoint == 25,
+          f"just above the band top must cool even with sp_margin 0.45, got "
+          f"{cmd.set_setpoint}: {cmd.reason}")
+
+
+def test_deadband_never_eats_the_rail_clearance():
+    # hard_min 25.2 sits 0.2 under the band floor — less than the keep-out — so the
+    # learned deadband must be fully suppressed on that side rather than inviting a trip.
+    c = fresh()
+    c.predictor.params.sp_margin = 0.45
+    p = params(target=26.1, band_low=0.4, band_high=0.65)
+    p.hard_min, p.hard_max = 25.2, 27.5
+    cmd = c.tick(sig(t=T0, comfort=25.65, slope=-0.02, power=700.0, setpoint=25, fan_on=False), p)
+    check(cmd.mode == const.MODE_EASING,
+          f"below the band floor (25.70) must ease, not sit inside a learned deadband, "
+          f"got {cmd.mode}: {cmd.reason}")
+
+
+def test_learned_params_are_clamped_on_load():
+    # A param learned under older/buggier rules must not stay out of range forever:
+    # gain froze at 0.164 because no episode could mature, and lead was left at the
+    # retired cap of 8.0.
+    from comfort_zone.model import ModelParams
+    from comfort_zone import const
+    from comfort_zone.adapt import GAIN_MIN
+    m = ModelParams.from_dict({
+        "dead_time_min": 17.0, "tau_min": 8.0, "gain_per_step": 0.164,
+        "power_lead_min": 6.0, "engage_watts": 150.0, "engage_window_min": 4.0,
+        "lead_min": 8.0, "sp_margin": 0.35,
+    })
+    check(m.gain_per_step >= GAIN_MIN, f"gain must load clamped to >= {GAIN_MIN}, got {m.gain_per_step}")
+    check(m.lead_min <= const.LEAD_CAP, f"lead must load clamped to <= {const.LEAD_CAP}, got {m.lead_min}")
+
+
+def test_overheat_blasts_below_the_normal_floor():
+    # The rail guard is not the optimizer: at the hot rail it may go colder than the
+    # optimizer's own floor to pull the room back.
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=27.5, cooldown_min=12)
+    p = params()                      # setpoint_min 24
+    out = g.evaluate(sig(comfort=27.6, setpoint=25), p, sp, Command())
+    check(out.mode == const.MODE_SAFETY_OVERHEAT, f"expected overheat, got {out.mode}")
+    check(out.set_setpoint == 22, f"overheat should blast to setpoint_min-2=22, got {out.set_setpoint}")
+    # …but never below what the device accepts
+    p.setpoint_device_min = 23
+    out = g.evaluate(sig(comfort=27.9, setpoint=25), p, sp, Command())
+    check(out.set_setpoint == 23, f"must respect the device floor 23, got {out.set_setpoint}")
 
 
 def _live_v3_controller():
@@ -475,13 +568,27 @@ def test_in_band_return_to_neutral():
     check(cmd.mode == const.MODE_EASING, f"expected easing, got {cmd.mode}")
 
 
-def test_midzone_uses_blower_not_setpoint():
-    # warm into the mid-zone (above comfort band 26.4 but below setpoint gate 26.65):
-    # the blower does the work, the compressor setpoint stays put
+def test_warm_side_has_no_midzone_the_blower_assists():
+    # There is no warm mid-zone any more: above the band the setpoint acts (comfort
+    # first — tolerating warmth is what blew the sd) and the blower assists in the
+    # same tick. The cost ordering survives as the dwell asymmetry: the blower may
+    # step every 3 min, the compressor only every ~9.
     c = fresh()
     cmd = c.tick(sig(comfort=26.5, slope=0.0, setpoint=26, blower_idx=0), params())
-    check(cmd.set_setpoint is None, f"mid-zone must NOT move the setpoint, got {cmd.set_setpoint}")
-    check(cmd.set_blower_idx == 1, f"mid-zone should raise the blower to 中, got {cmd.set_blower_idx}")
+    check(cmd.set_setpoint == 25, f"above the band the setpoint must act, got {cmd.set_setpoint}")
+    check(cmd.set_blower_idx == 1, f"the blower should assist to 中, got {cmd.set_blower_idx}")
+
+
+def test_cold_side_keeps_its_midzone():
+    # The deadband survives on the cold side, where it buys fewer AC power cycles —
+    # provided the rail is far enough away to afford it (here hard_min is 23.0).
+    c = fresh()
+    c.predictor.params.sp_margin = 0.5
+    p = params(target=26.0, band_low=0.4, band_high=0.4)   # band floor 25.6
+    p.hard_min, p.hard_max = 23.0, 29.0
+    cmd = c.tick(sig(comfort=25.45, slope=0.0, setpoint=26, fan_on=False), p)
+    check(cmd.set_setpoint is None,
+          f"just below the band floor must sit in the cold deadband, got {cmd.set_setpoint}")
 
 
 def test_excursion_depth_only_tightens_sp_margin():

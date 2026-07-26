@@ -29,6 +29,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .const import (
+    DEAD_MAX,
+    DEAD_MIN,
+    GAIN_MAX,
+    GAIN_MIN,
+    LEAD_CAP,
+    SP_MARGIN_CAP,
     MK_DEAD_TIME,
     MK_ENGAGE_WATTS,
     MK_ENGAGE_WINDOW,
@@ -39,6 +45,10 @@ from .const import (
     MK_TAU,
     MODEL_DEFAULTS,
 )
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 @dataclass
@@ -57,15 +67,18 @@ class ModelParams:
         d = dict(MODEL_DEFAULTS)
         if data:
             d.update({k: v for k, v in data.items() if k in d})
+        # Clamp on load: a value learned under older or buggier rules must not
+        # persist out of range (gain froze at 0.164 while no episode could mature,
+        # and lead was left sitting at a retired cap).
         return cls(
-            dead_time_min=float(d[MK_DEAD_TIME]),
+            dead_time_min=_clamp(float(d[MK_DEAD_TIME]), DEAD_MIN, DEAD_MAX),
             tau_min=float(d[MK_TAU]),
-            gain_per_step=float(d[MK_GAIN]),
+            gain_per_step=_clamp(float(d[MK_GAIN]), GAIN_MIN, GAIN_MAX),
             power_lead_min=float(d[MK_POWER_LEAD]),
             engage_watts=float(d[MK_ENGAGE_WATTS]),
             engage_window_min=float(d[MK_ENGAGE_WINDOW]),
-            lead_min=float(d[MK_LEAD]),
-            sp_margin=float(d[MK_SP_MARGIN]),
+            lead_min=_clamp(float(d[MK_LEAD]), 0.0, LEAD_CAP),
+            sp_margin=_clamp(float(d[MK_SP_MARGIN]), 0.0, SP_MARGIN_CAP),
         )
 
     def to_dict(self) -> dict:

@@ -32,12 +32,10 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from .const import LEAD_CAP, SP_MARGIN_CAP
+from .const import DEAD_MAX, DEAD_MIN, GAIN_MAX, GAIN_MIN, LEAD_CAP, SP_MARGIN_CAP
 from .model import ModelParams
 
 ALPHA = 0.3                 # EMA weight on the newest observation (fast)
-GAIN_MIN, GAIN_MAX = 0.1, 2.0
-DEAD_MIN, DEAD_MAX = 2.0, 25.0
 SLOPE_EPS = 0.02
 
 # Anticipation-lead learning: keep the worst band excursion within tolerance.

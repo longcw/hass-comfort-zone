@@ -37,6 +37,7 @@ from .const import (
 from .controller import Command, Signals, ZoneParams
 
 RELEASE_HYST = 0.3        # °C back inside the rail before releasing
+OVERHEAT_UNDERSHOOT = 2   # °C the guard goes BELOW the optimizer's setpoint floor
 MIN_OFF_MIN = 3.0         # min minutes the overcool guard keeps power off (compressor)
 RETRIP_MARGIN = 0.3       # °C past hard_min needed to re-trip overcool during the cooldown
 FAILSAFE_SETPOINT = 26    # parked setpoint when the sensor is truly gone
@@ -169,16 +170,20 @@ class SafetyGuard:
     def _overheat_cmd(self, s: Signals, p: ZoneParams, y: float, sp: SafetyParams) -> Command:
         top_blower = len(p.blower_levels) - 1 if p.blower_levels else None
         release = sp.hard_max - RELEASE_HYST
+        # The rail guard is not the optimizer, so it is not bound by the optimizer's
+        # setpoint floor: at the hot rail it goes OVERHEAT_UNDERSHOOT below it to pull
+        # the room back, clamped to what the unit will accept.
+        blast = max(p.setpoint_device_min, p.setpoint_min - OVERHEAT_UNDERSHOOT)
         reason = (
-            f"OVERHEAT guard: comfort {y:.2f} > hard_max {sp.hard_max:.1f} → full cool"
+            f"OVERHEAT guard: comfort {y:.2f} > hard_max {sp.hard_max:.1f} → full cool at {blast}"
             if y > sp.hard_max
-            else f"OVERHEAT guard: full cool, holding until comfort ≤ {release:.1f} (now {y:.2f})"
+            else f"OVERHEAT guard: full cool at {blast}, holding until comfort ≤ {release:.1f} (now {y:.2f})"
         )
         return Command(
             mode=MODE_SAFETY_OVERHEAT,
             reason=reason,
             set_ac_power=True,
-            set_setpoint=p.setpoint_min,
+            set_setpoint=blast,
             set_blower_idx=top_blower,
             set_fan=True,
             set_fan_level=p.fan_max_level,

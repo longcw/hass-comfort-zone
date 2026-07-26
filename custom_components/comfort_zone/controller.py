@@ -12,8 +12,10 @@ crib sensor's ~10-min thermal lag — and the comfort slope as ground truth:
 * **falling** (slope turned down) → cooling is winning → HOLD;
 * **power engaged** (demand rose since the step) and the model predicts the
   in-flight cooling lands in band → HOLD (be patient, don't stack);
-* **neither** power nor slope responded after the engagement window → the
-  command didn't take → step down again immediately (25→24→23);
+* **neither** power nor slope responded after a *dead-time-aware* window → the
+  command didn't take → step down again (25→24→23). The window has to outlast the
+  unit's own off-phase: a duty-cycling VRF shows no power rise for minutes at a
+  time, which is not the same as ignoring the command;
 * engaged but the prediction still lands warm → step again after a
   dead-time-aware dwell.
 
@@ -48,7 +50,7 @@ FAN_SPAN = 2.0           # °C above target at which the fan reaches its cap
 FF_NUDGE = 0.3           # °C the power feedforward shifts the effective temp
 MIN_DWELL_FLOOR = 6.0    # minutes; hard floor between setpoint commands (pace the compressor)
 BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
-RAIL_KEEPOUT = 0.1       # °C of the band→rail clearance the deadband may never use
+RAIL_KEEPOUT = 0.4       # °C of the band→rail clearance the deadband may never use
 
 
 def _rail_limited(margin: float, edge: float, rail: float | None) -> float:
@@ -86,6 +88,7 @@ class ZoneParams:
     fan_assist_enabled: bool = True
     hard_min: float | None = None   # safety rails, so the learned deadband
     hard_max: float | None = None   # can never widen into a guard trip
+    setpoint_device_min: int = 16   # lowest setpoint the unit accepts (guard blast)
 
     @property
     def regular_blower_max(self) -> int:
@@ -181,12 +184,13 @@ class Controller:
         # the mid-zone; the SETPOINT (compressor) only moves outside a WIDER
         # deadband [lo_sp, hi_sp] — sp_margin is learned. Fewer compressor moves.
         #
-        # The deadband is what we agree *not* to correct, so it must never reach a
-        # safety rail — otherwise the learner can widen the optimizer straight into
-        # a guard trip. Each side is clamped by its own rail clearance, so a tight
-        # cold rail cannot throw away the warm-side lever (where this room lives).
+        # COMFORT FIRST on the warm side: the setpoint acts at the band edge, full
+        # stop. Letting the learner widen this is what allowed the room to sit at
+        # 27.25 with the rail at 27.5 — calm, and too warm to be worth it. The
+        # deadband survives only as a COLD-side lever, where it buys something real
+        # (fewer AC power cycles) and is still clamped off the rail.
         sp_margin = max(0.0, min(SP_MARGIN_CAP, m.sp_margin))
-        hi_sp = hi + _rail_limited(sp_margin, hi, p.hard_max)
+        hi_sp = hi
         lo_sp = lo - _rail_limited(sp_margin, lo, p.hard_min)
         y = s.comfort
         slope = s.slope if s.slope is not None else 0.0
@@ -226,6 +230,14 @@ class Controller:
         if settled > hi_sp or y > hi_sp or y_ahead > hi_sp:
             recent_cool = self._last_cmd_cooling and mins <= (m.dead_time_min + m.tau_min)
             not_engaged = recent_cool and not engaged
+            # Power may only ever GRANT PATIENCE, never trigger an escalation.
+            # This VRF duty-cycles: measured off-phases run 2–5 min against ~18 min
+            # on-phases, so "no power rise yet" 4 min after a command is a normal off
+            # phase, not a command that failed to take — and the comfort slope cannot
+            # have responded either, with a dead time of ~17 min. Concluding "not
+            # engaged" on that window escalated the setpoint after nearly every step
+            # and drove the room into a 15-min limit cycle.
+            escalate_after = max(m.engage_window_min, m.dead_time_min * 0.8)
 
             if not s.ac_on:
                 cmd.set_ac_power = True
@@ -235,12 +247,13 @@ class Controller:
             elif falling:
                 cmd.mode = MODE_COOLING
                 cmd.reason = f"warm ({y:.2f}) but falling ({slope:+.3f}) → cooling winning, hold"
-            elif not_engaged and mins >= m.engage_window_min and s.setpoint and s.setpoint > p.setpoint_min:
+            elif not_engaged and mins >= escalate_after and s.setpoint and s.setpoint > p.setpoint_min:
                 # Neither power nor slope responded → the command didn't take.
                 self._command_setpoint(cmd, s, s.setpoint - 1)
                 dp = (s.power - self._power_at_cmd) if (s.power is not None and self._power_at_cmd is not None) else 0
                 cmd.mode = MODE_COOLING
-                cmd.reason = f"not engaged after {mins:.0f}m (Δpower {dp:+.0f}W, flat slope) → escalate to {cmd.set_setpoint}"
+                pw = f"Δpower {dp:+.0f}W"
+                cmd.reason = f"not engaged after {mins:.0f}m ({pw}, flat slope) → escalate to {cmd.set_setpoint}"
             elif settled <= hi and self.predictor.has_pending_cooling(s.now):
                 cmd.mode = MODE_COOLING
                 cmd.reason = (f"warm ({y:.2f}) but cooling in flight "

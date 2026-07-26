@@ -78,6 +78,16 @@ MK_SP_MARGIN: Final = "sp_margin"                  # extra deadband beyond the c
 
 LEAD_CAP: Final = 5.0          # max anticipation lead the learner may reach (min)
 SP_MARGIN_CAP: Final = 0.6     # max setpoint deadband the learner may reach (°C)
+# Bounds on the learned params. Enforced both when learning AND when loading from
+# storage, so a value learned under older rules can never persist out of range.
+# GAIN_MIN is deliberately not tiny: with saturated episodes excluded from learning,
+# a 1 °C setpoint step that settles under 0.3 °C is not physically credible, and a
+# too-small gain makes the controller under-credit its own in-flight cooling and
+# over-escalate.
+GAIN_MIN: Final = 0.3
+GAIN_MAX: Final = 2.0
+DEAD_MIN: Final = 2.0
+DEAD_MAX: Final = 25.0
 
 MODEL_DEFAULTS: Final = {
     MK_DEAD_TIME: 10.0,
