@@ -12,15 +12,23 @@ crib sensor's ~10-min thermal lag — and the comfort slope as ground truth:
 * **falling** (slope turned down) → cooling is winning → HOLD;
 * **power engaged** (demand rose since the step) and the model predicts the
   in-flight cooling lands in band → HOLD (be patient, don't stack);
-* **neither** power nor slope responded after a *dead-time-aware* window → the
-  command didn't take → step down again (25→24→23). The window has to outlast the
-  unit's own off-phase: a duty-cycling VRF shows no power rise for minutes at a
-  time, which is not the same as ignoring the command;
+* **power flat while RUNNING** → the command didn't take → step down again
+  (25→24→23), fast, without waiting out the dead time;
+* **power inconclusive** (the unit has not been seen running since the command —
+  it duty-cycles, so an off-phase proves nothing) → wait a dead-time-aware window,
+  because the slope cannot answer any sooner, then step;
 * engaged but the prediction still lands warm → step again after a
   dead-time-aware dwell.
 
-Power is confounded (whole-system), so it only ever *shortens the wait* or
-*grants patience*; the slope and the model decide the rest.
+**Power is read as a RUNNING LEVEL, never as an instantaneous sample.** This unit
+cycles (measured: ~18 min on, 2–5 min off), so comparing the sample at command time
+with the sample now is a sampling artifact: an off-phase reads as "the command did
+nothing", an on-phase as engagement. Only samples taken while it draws power count,
+and a *negative* verdict additionally needs several minutes of observed running,
+because the meter is whole-system and one room's step can be small.
+
+Power is confounded (whole-system), so it never overrides the slope or the model
+when they disagree; it makes the fast call when it has evidence.
 
 Actuator cost order: fan (cheap) → AC setpoint → AC blower → managed AC on/off.
 The blower only escalates to its **middle** level in normal use; the top level
@@ -51,6 +59,9 @@ FF_NUDGE = 0.3           # °C the power feedforward shifts the effective temp
 MIN_DWELL_FLOOR = 6.0    # minutes; hard floor between setpoint commands (pace the compressor)
 BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
 RAIL_KEEPOUT = 0.4       # °C of the band→rail clearance the deadband may never use
+POWER_JUDGE_MIN = 3.0    # minutes of observed RUNNING before power may judge a command
+#                          (the meter is whole-system, so one room's step can be small:
+#                           demand more watching before trusting a NEGATIVE verdict)
 
 
 def _rail_limited(margin: float, edge: float, rail: float | None) -> float:
@@ -111,8 +122,13 @@ class Controller:
     def __init__(self, predictor: FopdtPredictor) -> None:
         self.predictor = predictor
         self._last_cmd_at: datetime | None = None
-        self._power_at_cmd: float | None = None
         self._last_cmd_cooling = False
+        # Power bookkeeping: levels observed while the unit is RUNNING, never instants.
+        self._power_run_level: float | None = None        # latest running level
+        self._power_level_at_cmd: float | None = None     # running level when we commanded
+        self._power_run_max: float | None = None          # best running level since then
+        self._running_since_cmd = 0.0                     # minutes seen running since then
+        self._last_tick_at: datetime | None = None
         self._last_blower_at: datetime | None = None
         self._managed_off_since: datetime | None = None
 
@@ -132,8 +148,12 @@ class Controller:
         cmd.set_setpoint = new_sp
         self.predictor.record_setpoint_change(s.now, delta)
         self._last_cmd_at = s.now
-        self._power_at_cmd = s.power
         self._last_cmd_cooling = delta < 0
+        # Baseline for engagement is the last level seen while RUNNING — not the
+        # instantaneous reading, which may well be an off-phase.
+        self._power_level_at_cmd = self._power_run_level
+        self._power_run_max = None
+        self._running_since_cmd = 0.0
 
     def _cool_start_setpoint(self, p: ZoneParams) -> int:
         return max(p.setpoint_min, min(p.setpoint_max, round(p.target) - 1))
@@ -166,14 +186,55 @@ class Controller:
         note = f"blower→{p.blower_levels[cmd.set_blower_idx]}"
         cmd.reason = f"{cmd.reason}; {note}" if cmd.reason else note
 
-    def _power_engaged(self, s: Signals) -> bool:
-        """Has demand risen since our last cooling command? (fast, ~1–2 min)"""
-        if not self._last_cmd_cooling or s.power is None or self._power_at_cmd is None:
+    def _observe_power(self, s: Signals) -> None:
+        """Track the unit's RUNNING power level and how long it has been running.
+
+        This VRF duty-cycles (measured: ~18 min on, 2–5 min off), which makes a
+        comparison of two instantaneous samples worthless — an off-phase reads as
+        "the command did nothing" and an on-phase as engagement. So only samples
+        taken while the unit actually draws power count, and engagement is judged by
+        comparing *running levels*. Power stays the fast clue it should be; it just
+        stops being read through a sampling artifact.
+        """
+        dt = 0.0
+        if self._last_tick_at is not None:
+            dt = min((s.now - self._last_tick_at).total_seconds() / 60.0, 2.0)
+        self._last_tick_at = s.now
+        if s.power is None or s.power < self.predictor.params.engage_watts:
+            return                      # off-phase or no signal: tells us nothing
+        self._power_run_level = s.power
+        if self._last_cmd_at is not None and s.now >= self._last_cmd_at:
+            self._running_since_cmd += dt
+            self._power_run_max = (s.power if self._power_run_max is None
+                                   else max(self._power_run_max, s.power))
+
+    def _power_rise(self) -> float | None:
+        """Rise in running level since the last cooling command (None = unknown)."""
+        if not self._last_cmd_cooling:
+            return None
+        if self._power_level_at_cmd is None or self._power_run_max is None:
+            return None
+        return self._power_run_max - self._power_level_at_cmd
+
+    def _power_engaged(self) -> bool:
+        """Has the unit's running level risen since our cooling command? (fast)"""
+        rise = self._power_rise()
+        return rise is not None and rise >= self.predictor.params.engage_watts
+
+    def _power_says_unresponsive(self) -> bool:
+        """Have we watched it RUN long enough to conclude the command did nothing?
+
+        Requires observed running time — otherwise the verdict is *inconclusive*
+        (an off-phase is not evidence), and the caller waits instead.
+        """
+        if self._running_since_cmd < POWER_JUDGE_MIN:
             return False
-        return (s.power - self._power_at_cmd) >= self.predictor.params.engage_watts
+        rise = self._power_rise()
+        return rise is not None and rise < self.predictor.params.engage_watts
 
     # -- main tick ----------------------------------------------------------
     def tick(self, s: Signals, p: ZoneParams) -> Command:
+        self._observe_power(s)
         if s.comfort is None:
             return Command(mode=MODE_FAILSAFE, reason="no comfort reading")
 
@@ -206,7 +267,7 @@ class Controller:
         cooling_incoming = s.power_delta is not None and s.power_delta > m.engage_watts
         warming_incoming = s.power_delta is not None and s.power_delta < -m.engage_watts
         mins = self._mins_since_cmd(s.now)
-        engaged = falling or self._power_engaged(s)
+        engaged = falling or self._power_engaged()
 
         cmd = Command()
 
@@ -230,13 +291,12 @@ class Controller:
         if settled > hi_sp or y > hi_sp or y_ahead > hi_sp:
             recent_cool = self._last_cmd_cooling and mins <= (m.dead_time_min + m.tau_min)
             not_engaged = recent_cool and not engaged
-            # Power may only ever GRANT PATIENCE, never trigger an escalation.
-            # This VRF duty-cycles: measured off-phases run 2–5 min against ~18 min
-            # on-phases, so "no power rise yet" 4 min after a command is a normal off
-            # phase, not a command that failed to take — and the comfort slope cannot
-            # have responded either, with a dead time of ~17 min. Concluding "not
-            # engaged" on that window escalated the setpoint after nearly every step
-            # and drove the room into a 15-min limit cycle.
+            # Power is the fast clue: once we have watched the unit RUN for a couple
+            # of minutes at an unchanged level, the command demonstrably didn't take
+            # and we escalate immediately. When power is inconclusive (the unit has
+            # not been seen running yet — an off-phase proves nothing) we fall back to
+            # a dead-time-paced window, because the slope cannot answer any sooner.
+            power_dead = mins >= m.engage_window_min and self._power_says_unresponsive()
             escalate_after = max(m.engage_window_min, m.dead_time_min * 0.8)
 
             if not s.ac_on:
@@ -247,13 +307,16 @@ class Controller:
             elif falling:
                 cmd.mode = MODE_COOLING
                 cmd.reason = f"warm ({y:.2f}) but falling ({slope:+.3f}) → cooling winning, hold"
-            elif not_engaged and mins >= escalate_after and s.setpoint and s.setpoint > p.setpoint_min:
+            elif not_engaged and (power_dead or mins >= escalate_after) \
+                    and s.setpoint and s.setpoint > p.setpoint_min:
                 # Neither power nor slope responded → the command didn't take.
+                rise = self._power_rise()
                 self._command_setpoint(cmd, s, s.setpoint - 1)
-                dp = (s.power - self._power_at_cmd) if (s.power is not None and self._power_at_cmd is not None) else 0
+                why = (f"ran {self._running_since_cmd:.1f}m at an unchanged level "
+                       f"({rise:+.0f}W)" if power_dead
+                       else f"no power evidence in {mins:.0f}m, flat slope")
                 cmd.mode = MODE_COOLING
-                pw = f"Δpower {dp:+.0f}W"
-                cmd.reason = f"not engaged after {mins:.0f}m ({pw}, flat slope) → escalate to {cmd.set_setpoint}"
+                cmd.reason = f"not engaged: {why} → escalate to {cmd.set_setpoint}"
             elif settled <= hi and self.predictor.has_pending_cooling(s.now):
                 cmd.mode = MODE_COOLING
                 cmd.reason = (f"warm ({y:.2f}) but cooling in flight "

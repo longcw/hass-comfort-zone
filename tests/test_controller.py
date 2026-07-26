@@ -224,18 +224,55 @@ def test_off_phase_must_not_read_as_a_failed_command():
           f"got {out.set_setpoint}: {out.reason}")
 
 
-def test_a_genuinely_dead_command_still_escalates():
-    # The escape hatch survives, just paced by physics: once the dead-time window has
-    # passed with no power rise and no slope, the command really didn't take.
+def test_flat_power_while_running_escalates_fast():
+    # Power keeps its fast veto — it just has to compare RUNNING levels. Once we have
+    # watched the unit actually run for a couple of minutes at an unchanged level, the
+    # command demonstrably didn't take, and we escalate without waiting out the dead time.
     c = fresh()
     c.predictor.params.dead_time_min = 17.0
     p = params(target=26.1, band_low=0.4, band_high=0.65)
-    c.tick(sig(t=T0, comfort=26.9, slope=0.03, power=670.0, setpoint=26), p)
-    out = c.tick(sig(t=T0 + timedelta(minutes=14), comfort=27.0, slope=0.03,
-                     power=670.0, setpoint=25), p)
+    first = c.tick(sig(t=T0, comfort=26.9, slope=0.03, power=670.0, setpoint=26), p)
+    check(first.set_setpoint == 25, f"warm room should step, got {first.set_setpoint}")
+    out = None
+    for i in range(1, 7):                       # ticks every 45 s, unit running, level flat
+        out = c.tick(sig(t=T0 + timedelta(seconds=45 * i), comfort=26.95, slope=0.03,
+                         power=665.0, setpoint=25), p)
     check(out.set_setpoint == 24,
-          f"after the dead-time window a flat response should escalate, "
+          f"flat running level ⇒ the step didn't take ⇒ escalate well before the "
+          f"dead time (4.5 min in), got {out.set_setpoint}: {out.reason}")
+
+
+def test_power_ramp_grants_patience():
+    # The mirror case, which v3.1 got wrong by reading a point sample of 1 W: the unit
+    # ramped hard after the command, so be patient rather than stacking another step.
+    c = fresh()
+    c.predictor.params.dead_time_min = 17.0
+    p = params(target=26.1, band_low=0.4, band_high=0.65)
+    c.tick(sig(t=T0, comfort=26.9, slope=0.03, power=640.0, setpoint=26), p)
+    out = None
+    for i in range(1, 9):
+        out = c.tick(sig(t=T0 + timedelta(seconds=45 * i), comfort=26.95, slope=0.0,
+                         power=1058.0, setpoint=25), p)
+    check(out.set_setpoint is None,
+          f"a +418 W ramp is engagement — must not stack another step, "
           f"got {out.set_setpoint}: {out.reason}")
+
+
+def test_no_power_signal_falls_back_to_the_dead_time_window():
+    # With no usable power at all, the slope is the only evidence and it cannot answer
+    # before the dead time — so wait, then escalate.
+    c = fresh()
+    c.predictor.params.dead_time_min = 17.0
+    p = params(target=26.1, band_low=0.4, band_high=0.65)
+    c.tick(sig(t=T0, comfort=26.9, slope=0.03, power=None, setpoint=26), p)
+    early = c.tick(sig(t=T0 + timedelta(minutes=4, seconds=30), comfort=26.95,
+                       slope=0.03, power=None, setpoint=25), p)
+    check(early.set_setpoint is None, f"must not escalate blind at 4.5 min, got {early.set_setpoint}")
+    late = c.tick(sig(t=T0 + timedelta(minutes=14), comfort=27.0, slope=0.03,
+                      power=None, setpoint=25), p)
+    check(late.set_setpoint == 24,
+          f"after the dead-time window a flat response should escalate, "
+          f"got {late.set_setpoint}: {late.reason}")
 
 
 def test_warm_side_setpoint_acts_at_the_band_edge():
