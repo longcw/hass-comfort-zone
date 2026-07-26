@@ -71,6 +71,30 @@ def test_asymmetric_band():
     check(cmd2.mode == const.MODE_EASING, f"24.9 below the setpoint band should ease, got {cmd2.mode}")
 
 
+def test_blower_steps_up_inside_the_band_before_the_compressor():
+    # The blower is the cheapest AC lever (it modulates cold-air delivery without
+    # touching the compressor), so it must act while comfort is still INSIDE the band —
+    # ahead of the setpoint, not simultaneously with it.
+    c = fresh()
+    p = params(target=26.0, band_low=0.4, band_high=0.6)   # mid trigger 26.30, band top 26.60
+    cmd = c.tick(sig(comfort=26.40, slope=0.02, setpoint=26, blower_idx=0), p)
+    check(cmd.set_blower_idx == 1, f"inside the band above the mid trigger → 中风, got {cmd.set_blower_idx}")
+    check(cmd.set_setpoint is None,
+          f"the compressor must NOT move yet at 26.40 (band top 26.60), got {cmd.set_setpoint}")
+
+
+def test_blower_holds_between_target_and_the_mid_trigger():
+    # Hysteresis: up at target + band_high/2, down only at/below target. In between it
+    # stays put, so it cannot chatter around the threshold.
+    c = fresh()
+    p = params(target=26.0, band_low=0.4, band_high=0.6)   # mid trigger 26.30
+    cmd = c.tick(sig(comfort=26.15, slope=0.02, setpoint=26, blower_idx=0), p)
+    check(cmd.set_blower_idx is None, f"below the mid trigger must not raise it, got {cmd.set_blower_idx}")
+    cmd = c.tick(sig(comfort=26.15, slope=0.02, setpoint=26, blower_idx=1), p)
+    check(cmd.set_blower_idx is None,
+          f"…and must not drop it either until target, got {cmd.set_blower_idx}")
+
+
 def test_blower_drops_to_low_at_or_below_target():
     # comfort below target, blower at 中 (idx1) → step down to 低 (idx0)
     c = fresh()

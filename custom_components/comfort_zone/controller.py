@@ -30,10 +30,14 @@ because the meter is whole-system and one room's step can be small.
 Power is confounded (whole-system), so it never overrides the slope or the model
 when they disagree; it makes the fast call when it has evidence.
 
-Actuator cost order: fan (cheap) → AC setpoint → AC blower → managed AC on/off.
-The blower only escalates to its **middle** level in normal use; the top level
-(高风) is reserved for the safety guard. When fan-assist is disabled the fan is
-never used (and the caller passes a tighter band).
+Actuator cost order: circulation fan (cheapest) → AC blower → AC setpoint →
+managed AC on/off — and each lever must actually get its turn *before* the next
+one, which means the cheap ones work **inside** the band rather than waiting for an
+out-of-band excursion. The fan is proportional; the blower is a two-level lever
+(中风 above ``target + band_high × BLOWER_MID_FRAC``, 低风 at/below target), so it
+engages before the compressor gate at the band top. 高风 is reserved for the safety
+guard. When fan-assist is disabled the fan is never used (and the caller passes a
+tighter band).
 """
 from __future__ import annotations
 
@@ -68,6 +72,7 @@ FF_TRIGGER_MULT = 2.0    # × engage_watts before the feedforward nudges the fan
 #                          means the fan keeps blowing while cooling is arriving.
 MIN_DWELL_FLOOR = 6.0    # minutes; hard floor between setpoint commands (pace the compressor)
 BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
+BLOWER_MID_FRAC = 0.5    # of band_high above target → step the blower to its mid level
 RAIL_KEEPOUT = 0.4       # °C of the band→rail clearance the deadband may never use
 POWER_JUDGE_MIN = 3.0    # minutes of observed RUNNING before power may judge a command
 #                          (the meter is whole-system, so one room's step can be small:
@@ -169,23 +174,30 @@ class Controller:
         return max(p.setpoint_min, min(p.setpoint_max, round(p.target) - 1))
 
     def _manage_blower(self, cmd: Command, s: Signals, p: ZoneParams,
-                       y: float, hi: float, falling: bool) -> None:
-        """The AC blower is the MID-ZONE lever — cheaper than a setpoint change
-        (it modulates cold-air delivery without cycling the compressor). So it's
-        the first AC response to warmth: 中风 whenever comfort is above the comfort
-        band (the mid-zone, before the setpoint moves at the wider edge); 低风
-        (quiet, least draft) at/below target; held in between. 高风 is reserved
-        for the safety guard.
+                       y: float, falling: bool) -> None:
+        """The AC blower is a TEMPERATURE LEVER, not an out-of-band reaction.
+
+        It is the cheapest AC actuator — it modulates cold-air delivery without
+        cycling the compressor — so it must act while comfort is still *inside* the
+        band, ahead of the setpoint. With 高风 reserved for the safety guard there
+        are only two usable grades, so it is a two-level lever with hysteresis:
+
+        * **中风** once comfort is more than ``band_high × BLOWER_MID_FRAC`` above
+          target and not already falling — reached before the setpoint gate at the
+          band top, which is what keeps the cost order fan → blower → compressor real;
+        * **低风** (quiet, least draft) at/below target;
+        * held in between, so it cannot chatter around the threshold.
         """
         if not p.blower_levels or cmd.set_blower_idx is not None:
             return
         cur = s.blower_idx if s.blower_idx is not None else 0
-        if y > hi and not falling:
-            desired = p.regular_blower_max   # warm beyond the comfort band → more airflow
+        mid_on = p.target + p.band_high * BLOWER_MID_FRAC
+        if y > mid_on and not falling:
+            desired = p.regular_blower_max   # warming inside the band → more airflow
         elif y <= p.target:
             desired = 0
         else:
-            return  # warm-but-within-band → leave the blower where it is
+            return  # between target and the mid trigger → hold (hysteresis)
         if desired == cur:
             return
         if self._last_blower_at is not None and \
@@ -393,7 +405,7 @@ class Controller:
             cmd.reason = f"anticipating ({y_ahead:.2f}) — {cmd.reason}"
 
         # === 5. AC blower (mid-zone lever) + fan comfort layer ==============
-        self._manage_blower(cmd, s, p, y, hi, falling)
+        self._manage_blower(cmd, s, p, y, falling)
         self._fan_layer(cmd, s, p, trend, cooling_incoming, warming_incoming)
         if cmd.mode == MODE_IDLE and (cmd.set_fan or cmd.set_fan_level is not None):
             cmd.mode = MODE_FAN_ASSIST
