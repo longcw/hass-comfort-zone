@@ -56,11 +56,16 @@ SLOPE_EPS = 0.02          # °C/min considered "flat"
 FAN_HYST = 0.1            # °C hysteresis around target for fan on/off
 FAN_SPAN = 2.0           # °C above target at which the fan reaches its cap
 FF_NUDGE = 0.3           # °C the power feedforward shifts the effective temp
-FF_TRIGGER_MULT = 2.5    # × engage_watts before the feedforward nudges the fan.
-#                          engage_watts is calibrated for a STEP at a known moment;
-#                          this signal is a 12-min mean of a duty-cycled load, whose
-#                          residual duty artifact is itself ~150 W. Real ramps measure
-#                          +450…+650 W, so demand that much before biasing the fan.
+FF_TRIGGER_MULT = 2.0    # × engage_watts before the feedforward nudges the fan.
+#                          engage_watts is calibrated for a STEP at a known moment; this
+#                          signal is a 12-min mean of a duty-cycled load. Set from the
+#                          measured separation, not from taste: with no command in the
+#                          window |trend| sits at p90 ≈ 195 W, while real ramps measure
+#                          +450…+650 W. Note the trigger does NOT damp chatter — the
+#                          nudge changes direction ~18×/night at 150, 300 or 375 W alike
+#                          (that is the estimator's job, see model.power_trend), so
+#                          within the separating band prefer sensitivity: a missed ramp
+#                          means the fan keeps blowing while cooling is arriving.
 MIN_DWELL_FLOOR = 6.0    # minutes; hard floor between setpoint commands (pace the compressor)
 BLOWER_DWELL = 3.0       # minutes; min interval between AC blower changes
 RAIL_KEEPOUT = 0.4       # °C of the band→rail clearance the deadband may never use
