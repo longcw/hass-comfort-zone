@@ -56,6 +56,24 @@
   const snap = (v, step) => Math.round(v / step) * step;
   const fnum = (v) => (v === null || v === undefined || v === "" || isNaN(+v) ? null : +v);
 
+  // Blower level names shown in the UI. Units label the same three speeds every
+  // which way (低风/弱风/Low/Quiet …); display one consistent set regardless of
+  // which vendor label the device happens to report. Unknown labels pass through.
+  const BLOWER_LABELS = {
+    "低风": "低速", "低速": "低速", "弱风": "低速", "low": "低速", "quiet": "低速",
+    "silent": "低速", "weak": "低速", "level1": "低速",
+    "中风": "中速", "中速": "中速", "medium": "中速", "mid": "中速", "middle": "中速",
+    "normal": "中速", "level2": "中速",
+    "高风": "高速", "高速": "高速", "强风": "高速", "high": "高速", "strong": "高速",
+    "turbo": "高速", "powerful": "高速", "level3": "高速",
+    "自动": "自动", "auto": "自动",
+  };
+  const blowerLabel = (v) => {
+    if (v === null || v === undefined) return v;
+    const k = String(v).trim();
+    return BLOWER_LABELS[k] ?? BLOWER_LABELS[k.toLowerCase()] ?? v;
+  };
+
   // ---------------------------------------------------------------------------
   class ComfortZoneCard extends HTMLElement {
     setConfig(config) {
@@ -302,7 +320,7 @@
       const acOn = acSt ? !["off", "unavailable", "unknown"].includes(acSt.state) : a.ac_on;
       const acState = acSt ? acSt.state : a.ac_state;
       const acSetpoint = acSt ? fnum(acSt.attributes.temperature) : a.setpoint;
-      const acBlower = acSt ? acSt.attributes.fan_mode : a.ac_blower;
+      const acBlower = blowerLabel(acSt ? acSt.attributes.fan_mode : a.ac_blower);
       let acChip;
       if (acOn) {
         const st = acState && acState !== "cool" ? acState : "cool";
@@ -451,7 +469,9 @@
       const t = d && !isNaN(d)
         ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
         : "";
-      const acts = (e.actions || []).join(" · ");
+      const acts = (e.actions || [])
+        .map((x) => (x.startsWith("blower=") ? `blower=${blowerLabel(x.slice(7))}` : x))
+        .join(" · ");
       return `<div class="row">
           <span class="t">${t}</span>
           <span class="rpill" style="--c:${meta.color}">${meta.label}</span>
