@@ -17,7 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .actuators import Bindings, apply
+from .actuators import Bindings, apply, resolve_blower_ladder
 from .adapt import OnlineAdapter
 from .comfort import comfort_temp
 from .const import (
@@ -62,7 +62,6 @@ from .store import ZoneStore
 
 _LOGGER = logging.getLogger(__name__)
 
-BLOWER_ORDER = ["低风", "中风", "高风"]  # ascending cooling intensity (subset of VRF modes)
 SLOPE_WINDOW_MIN = 5.0
 # How long without a *fresh report* before we stop trusting the reading. Wide
 # enough to tolerate normal BLE gaps (the crib thermometer can go quiet ~10 min);
@@ -150,9 +149,9 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         return now_t >= start or now_t < end
 
     def _blower_levels(self) -> list[str]:
+        """The device's own labels for our low→high blower ladder (see actuators)."""
         st = self.hass.states.get(self.entry.data[CONF_AC_CLIMATE])
-        modes = (st.attributes.get("fan_modes") if st else None) or []
-        return [m for m in BLOWER_ORDER if m in modes]
+        return resolve_blower_ladder(st.attributes.get("fan_modes") if st else None)
 
     # -- signal reading -----------------------------------------------------
     def _read_comfort(self, opts: dict, now) -> tuple[float | None, bool]:

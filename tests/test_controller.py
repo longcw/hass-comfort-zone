@@ -14,7 +14,7 @@ from comfort_zone.model import FopdtPredictor, ModelParams  # noqa: E402
 from comfort_zone.safety import SafetyGuard, SafetyParams  # noqa: E402
 from comfort_zone import const  # noqa: E402
 
-BLOWERS = ["低风", "中风", "高风"]
+BLOWERS = ["low", "mid", "high"]   # opaque device labels; the controller only uses indices
 T0 = datetime(2026, 7, 24, 12, 0, 0)
 
 
@@ -71,6 +71,22 @@ def test_asymmetric_band():
     check(cmd2.mode == const.MODE_EASING, f"24.9 below the setpoint band should ease, got {cmd2.mode}")
 
 
+def test_blower_ladder_is_resolved_from_the_device_not_hardcoded():
+    # We speak low/mid/high; the device's own labels are vendor- and locale-specific,
+    # so they stay an implementation detail of this one lookup.
+    from comfort_zone.actuators import resolve_blower_ladder as r
+    check(r(["自动", "低风", "中风", "高风"]) == ["低风", "中风", "高风"],
+          f"Chinese VRF labels, auto excluded, got {r(['自动', '低风', '中风', '高风'])}")
+    check(r(["Auto", "Low", "Medium", "High"]) == ["Low", "Medium", "High"],
+          f"English labels, got {r(['Auto', 'Low', 'Medium', 'High'])}")
+    check(r(["high", "low", "medium"]) == ["low", "medium", "high"],
+          f"must sort ascending regardless of the device's order, got {r(['high', 'low', 'medium'])}")
+    check(r(["Quiet", "Turbo"]) == ["Quiet", "Turbo"], f"partial ladders are fine, got {r(['Quiet', 'Turbo'])}")
+    check(r(["自动"]) == [], "auto-only device has no usable ladder")
+    check(r([]) == [] and r(None) == [], "no fan modes → no ladder")
+    check(r(["低风", "中风", "高风", "中风"]) == ["低风", "中风", "高风"], "no duplicates")
+
+
 def test_blower_steps_up_inside_the_band_before_the_compressor():
     # The blower is the cheapest AC lever (it modulates cold-air delivery without
     # touching the compressor), so it must act while comfort is still INSIDE the band —
@@ -78,7 +94,7 @@ def test_blower_steps_up_inside_the_band_before_the_compressor():
     c = fresh()
     p = params(target=26.0, band_low=0.4, band_high=0.6)   # mid trigger 26.30, band top 26.60
     cmd = c.tick(sig(comfort=26.40, slope=0.02, setpoint=26, blower_idx=0), p)
-    check(cmd.set_blower_idx == 1, f"inside the band above the mid trigger → 中风, got {cmd.set_blower_idx}")
+    check(cmd.set_blower_idx == 1, f"inside the band above the mid trigger → mid, got {cmd.set_blower_idx}")
     check(cmd.set_setpoint is None,
           f"the compressor must NOT move yet at 26.40 (band top 26.60), got {cmd.set_setpoint}")
 

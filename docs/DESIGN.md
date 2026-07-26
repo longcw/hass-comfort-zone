@@ -70,7 +70,7 @@ ladder. Anti-churn is achieved **not by a fixed freeze** but by:
   → ② if sustained & AC unlocked, step setpoint down + engagement check
   → ③ raise AC blower.
 - *Cold* (ŷ/y below target−band): ① fan down→off → ② setpoint up + blower down
-  (低风, quiet) → ③ still overcooling → **managed AC-off** (record we did it) with
+  (lowest blower level, quiet) → ③ still overcooling → **managed AC-off** (record we did it) with
   a **guaranteed auto-return** watchdog.
 - *Feedforward:* power spiking → suppress further AC-down + pre-trim fan; power
   collapsing + slope confirms → pre-raise fan ahead of the sensor.

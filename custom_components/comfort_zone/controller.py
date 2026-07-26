@@ -34,10 +34,11 @@ Actuator cost order: circulation fan (cheapest) → AC blower → AC setpoint �
 managed AC on/off — and each lever must actually get its turn *before* the next
 one, which means the cheap ones work **inside** the band rather than waiting for an
 out-of-band excursion. The fan is proportional; the blower is a two-level lever
-(中风 above ``target + band_high × BLOWER_MID_FRAC``, 低风 at/below target), so it
-engages before the compressor gate at the band top. 高风 is reserved for the safety
-guard. When fan-assist is disabled the fan is never used (and the caller passes a
-tighter band).
+(**mid** above ``target + band_high × BLOWER_MID_FRAC``, **low** at/below target), so
+it engages before the compressor gate at the band top. The ladder's **top** level is
+reserved for the safety guard. Level names are ours; the device's own labels are
+resolved in :mod:`actuators` and never appear in the control logic. When fan-assist
+is disabled the circulation fan is never used (and the caller passes a tighter band).
 """
 from __future__ import annotations
 
@@ -179,13 +180,14 @@ class Controller:
 
         It is the cheapest AC actuator — it modulates cold-air delivery without
         cycling the compressor — so it must act while comfort is still *inside* the
-        band, ahead of the setpoint. With 高风 reserved for the safety guard there
-        are only two usable grades, so it is a two-level lever with hysteresis:
+        band, ahead of the setpoint. With the ladder's top level reserved for the
+        safety guard there are only two usable grades, so it is a two-level lever
+        with hysteresis:
 
-        * **中风** once comfort is more than ``band_high × BLOWER_MID_FRAC`` above
+        * **mid** once comfort is more than ``band_high × BLOWER_MID_FRAC`` above
           target and not already falling — reached before the setpoint gate at the
           band top, which is what keeps the cost order fan → blower → compressor real;
-        * **低风** (quiet, least draft) at/below target;
+        * **low** (quiet, least draft) at/below target;
         * held in between, so it cannot chatter around the threshold.
         """
         if not p.blower_levels or cmd.set_blower_idx is not None:

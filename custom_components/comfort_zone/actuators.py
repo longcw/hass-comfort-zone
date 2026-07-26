@@ -16,6 +16,39 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 
+# The blower ladder, ascending cooling intensity. We speak **low / mid / high**; the
+# labels a unit advertises in ``fan_modes`` are vendor- and locale-specific (this VRF
+# says 低风/中风/高风, others say Low/Medium/High or Quiet/Turbo), so those strings stay
+# an implementation detail of this one lookup instead of leaking into the control logic
+# — which only ever works with ladder *indices*.
+BLOWER_SYNONYMS: tuple[tuple[str, ...], ...] = (
+    ("低风", "低速", "弱风", "low", "quiet", "silent", "weak", "level1", "1"),
+    ("中风", "中速", "medium", "mid", "middle", "normal", "level2", "2"),
+    ("高风", "高速", "强风", "high", "strong", "turbo", "powerful", "level3", "3"),
+)
+
+
+def _normalise(label: str) -> str:
+    return "".join(label.split()).replace("_", "").replace("-", "").casefold()
+
+
+def resolve_blower_ladder(fan_modes) -> list[str]:
+    """Pick the device's own labels for our low→high ladder, in ascending order.
+
+    Anything we cannot place (notably "auto", which is not an intensity) is left out.
+    An empty result simply means this unit has no usable blower ladder, and the
+    controller skips that actuator.
+    """
+    ladder: list[str] = []
+    for synonyms in BLOWER_SYNONYMS:
+        for mode in fan_modes or []:
+            norm = _normalise(str(mode))
+            if norm in synonyms and mode not in ladder:
+                ladder.append(mode)
+                break
+    return ladder
+
+
 @dataclass
 class Bindings:
     ac_climate: str
