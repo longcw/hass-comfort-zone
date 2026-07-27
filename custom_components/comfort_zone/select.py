@@ -32,3 +32,4 @@ class _StrategySelect(ComfortZoneEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         options = {**(self.coordinator.entry.options or {}), OPT_STRATEGY: option}
         self.hass.config_entries.async_update_entry(self.coordinator.entry, options=options)
+        self.async_write_ha_state()  # reflect instantly, don't wait for the tick

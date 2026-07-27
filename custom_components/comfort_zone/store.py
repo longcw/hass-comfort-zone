@@ -1,4 +1,4 @@
-"""Persistence for a zone: fitted model, target schedule, strategy, decision log.
+"""Persistence for a zone: fitted model, target schedule, switch state, decision log.
 
 Backed by Home Assistant's ``Store`` helper (JSON under ``.storage``). The
 decision log is bounded and is what the UI's history view and (eventually) the
@@ -66,6 +66,15 @@ class ZoneStore:
         idx = (hour * 60 + minute) // 30
         idx = max(0, min(SCHEDULE_POINTS - 1, idx))
         return float(self.schedule_for(strategy)[idx])
+
+    # -- switch state -------------------------------------------------------
+    def flag(self, key: str, default: bool = True) -> bool:
+        """A switch position the user set; it outlives reloads and restarts."""
+        return bool(self._data.get("flags", {}).get(key, default))
+
+    async def set_flag(self, key: str, value: bool) -> None:
+        self._data.setdefault("flags", {})[key] = bool(value)
+        await self._save()
 
     # -- decision log -------------------------------------------------------
     @property

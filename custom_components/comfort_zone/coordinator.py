@@ -113,6 +113,8 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
     # -- lifecycle ----------------------------------------------------------
     async def async_prepare(self) -> None:
         await self.store.load()
+        self.enabled = self.store.flag("enabled")
+        self.fan_assist = self.store.flag("fan_assist")
         self.reload_model()
 
     async def async_start(self) -> None:
@@ -126,11 +128,13 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         self._controller = Controller(self._predictor)
         self._adapter = OnlineAdapter(self._predictor.params)
 
-    def set_enabled(self, value: bool) -> None:
+    async def async_set_enabled(self, value: bool) -> None:
         self.enabled = value
+        await self.store.set_flag("enabled", value)
 
-    def set_fan_assist(self, value: bool) -> None:
+    async def async_set_fan_assist(self, value: bool) -> None:
         self.fan_assist = value
+        await self.store.set_flag("fan_assist", value)
 
     # -- option resolution --------------------------------------------------
     def options(self) -> dict:

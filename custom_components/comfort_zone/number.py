@@ -74,3 +74,6 @@ class _KnobNumber(ComfortZoneEntity, NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         options = {**(self.coordinator.entry.options or {}), self._knob.key: value}
         self.hass.config_entries.async_update_entry(self.coordinator.entry, options=options)
+        # Publish now: a tick can spend seconds inside the AC's cloud API, and a
+        # stepper that reads back the old value turns the next tap into a no-op.
+        self.async_write_ha_state()

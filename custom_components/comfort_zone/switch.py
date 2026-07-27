@@ -28,12 +28,12 @@ class _EnableSwitch(ComfortZoneEntity, SwitchEntity):
         return self.coordinator.enabled
 
     async def async_turn_on(self, **kwargs) -> None:
-        self.coordinator.set_enabled(True)
+        await self.coordinator.async_set_enabled(True)
         self.async_write_ha_state()  # reflect instantly, don't wait for the tick
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
-        self.coordinator.set_enabled(False)
+        await self.coordinator.async_set_enabled(False)
         self.async_write_ha_state()
         await self.coordinator.async_request_refresh()
 
@@ -51,11 +51,11 @@ class _FanAssistSwitch(ComfortZoneEntity, SwitchEntity):
         return self.coordinator.fan_assist
 
     async def async_turn_on(self, **kwargs) -> None:
-        self.coordinator.set_fan_assist(True)
+        await self.coordinator.async_set_fan_assist(True)
         self.async_write_ha_state()  # reflect instantly, don't wait for the tick
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
-        self.coordinator.set_fan_assist(False)
+        await self.coordinator.async_set_fan_assist(False)
         self.async_write_ha_state()
         await self.coordinator.async_request_refresh()

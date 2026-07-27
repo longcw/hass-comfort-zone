@@ -24,7 +24,7 @@ async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_reload))
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await coordinator.async_start()
 
     await _async_register_services(hass)
@@ -40,8 +40,19 @@ async def async_unload_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> boo
     return unloaded
 
 
-async def _async_reload(hass: "HomeAssistant", entry: "ConfigEntry") -> None:
-    await hass.config_entries.async_reload(entry.entry_id)
+async def _async_options_updated(hass: "HomeAssistant", entry: "ConfigEntry") -> None:
+    """Apply an option change on the next tick without rebuilding the zone.
+
+    Options are read live from the entry, so a reload would only discard what
+    the running zone has learned — power/comfort history, the safety cooldown,
+    the controller's dead-time timers. Rebinding entities (the reconfigure
+    step) reloads on its own.
+    """
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is None:  # a concurrent reload already replaced the zone
+        return
+    coordinator.async_update_listeners()  # options-flow edits show up now, not after the tick
+    await coordinator.async_request_refresh()
 
 
 async def _async_register_services(hass: "HomeAssistant") -> None:
