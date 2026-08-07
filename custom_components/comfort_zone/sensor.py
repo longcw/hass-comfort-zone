@@ -111,9 +111,7 @@ class _StatusSensor(ComfortZoneEntity, SensorEntity):
             # shifted down whenever no fan can run.
             "zone_lo": s.get("zone_lo"),
             "zone_hi": s.get("zone_hi"),
-            # The rails actually in force. Worth surfacing because they are not always
-            # the configured ones: a rail nearer the band than its clearance is pushed
-            # out (see safety.effective_rails), and that has to be visible somewhere.
+            # The safety rails, exactly as configured. Nothing adjusts them.
             "hard_min": s.get("hard_min"),
             "hard_max": s.get("hard_max"),
             # The quiet limits in force now, so the card need not work out the window.

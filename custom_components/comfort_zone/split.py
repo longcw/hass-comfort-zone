@@ -63,6 +63,11 @@ from datetime import datetime
 # reintroduce the limit cycle.
 SP_HYSTERESIS = 0.15        # the minimum, used when the floor is lower
 SP_HYSTERESIS_MARGIN = 0.15  # clearance above the floor, so it is not marginal
+# Once the room is outside its comfort zone the threshold collapses toward this,
+# reaching it URGENT_SPAN °C out. Half a step is the least it can ever be: below
+# that the nearest integer is by definition already the right one.
+SP_MIN_THRESHOLD = 0.5
+URGENT_SPAN = 0.3
 # Minutes between setpoint commands. Hardware, about the compressor, never relaxed.
 SP_DWELL_MIN = 6.0
 # Minutes between blower changes, and how far past a level boundary the demand must
@@ -103,17 +108,57 @@ class SplitRange:
         self._last_sp_at: datetime | None = None
         self._last_blower_at: datetime | None = None
 
-    @property
-    def sp_threshold(self) -> float:
+    def sp_threshold(self, urgency: float = 0.0) -> float:
         """How far the demand must sit from the setpoint before it moves.
 
-        Never below the anti-hunting floor derived above.
+        The anti-hunting floor below only applies while there is nothing to fix.
+        Hysteresis exists to stop the setpoint chasing its own ripple, and ripple
+        is a problem *inside* the comfort zone; once the room has left the zone,
+        refusing to act is not patience, it is the failure.
+
+        Measured 08-07 06:08 with a fixed 0.81 threshold: the room fell from 25.85
+        to 25.21 over fourteen minutes, more than half a degree below its zone,
+        while the loop sat on a setpoint of 24 waiting for the demand to travel far
+        enough to qualify. Nothing was logged, because nothing was actuated.
+
+        So ``urgency`` — how far outside the zone the room is, in °C — collapses the
+        threshold toward the bare half-step. The zone itself is what stops the
+        limit cycle now: a step that brings the room back inside produces zero
+        error, so there is no demand left to chase it back out.
         """
         base = 0.5 + SP_HYSTERESIS
-        if self.model is None:
+        if self.model is not None:
+            floor = (1.0 + self.model.kc * self.model.gain_per_step) / 2.0
+            base = max(base, floor + SP_HYSTERESIS_MARGIN)
+        if urgency <= 0.0:
             return base
-        floor = (1.0 + self.model.kc * self.model.gain_per_step) / 2.0
-        return max(base, floor + SP_HYSTERESIS_MARGIN)
+        # The collapse target is the anti-hunting floor while the room is only
+        # mildly out — and the bare half-step once it is far enough out that the
+        # floor's own argument no longer applies.
+        #
+        # That argument is about a step landing no closer than it started, which can
+        # only happen when one step is comparable to the whole error. Once the room
+        # is more than a step's worth of room temperature outside its zone — one
+        # setpoint level is `gain_per_step` °C of room — a full step is unambiguously
+        # in the right direction and cannot be reversed by its own arrival. Holding
+        # the floor there buys nothing and costs minutes, measured: three of them,
+        # and 0.16 °C of extra fall, on the 08-07 trajectory.
+        floor = SP_MIN_THRESHOLD
+        step_worth = SP_MIN_THRESHOLD
+        if self.model is not None:
+            floor = max(SP_MIN_THRESHOLD,
+                        (1.0 + self.model.kc * self.model.gain_per_step) / 2.0)
+            step_worth = max(0.1, self.model.gain_per_step)
+        target = floor if urgency < step_worth else SP_MIN_THRESHOLD
+        frac = min(1.0, urgency / URGENT_SPAN)
+        return base - (base - target) * frac
+
+    def commit(self, now: datetime, setpoint_issued: bool, blower_issued: bool) -> None:
+        """Start the dwell clocks, for commands the caller actually applied."""
+        if setpoint_issued:
+            self._last_sp_at = now
+        if blower_issued:
+            self._last_blower_at = now
 
     def _elapsed(self, at: datetime | None, now: datetime) -> float:
         return 1e9 if at is None else (now - at).total_seconds() / 60.0
@@ -128,7 +173,8 @@ class SplitRange:
         return (p.setpoint_min - p.regular_blower_max * g, float(p.setpoint_max))
 
     def resolve(self, u_raw: float, now: datetime, cur_sp: int | None,
-                cur_blower: int | None, p, cur_fan_on: bool = False) -> SplitOutput:
+                cur_blower: int | None, p, cur_fan_on: bool = False,
+                urgency: float = 0.0) -> SplitOutput:
         g = p.blower_gain if p.blower_gain > BLOWER_EPS else 0.0
         b_max = p.regular_blower_max
         cur_b = cur_blower if cur_blower is not None else 0
@@ -141,15 +187,18 @@ class SplitRange:
         blocked = False
         if cur_sp is None:
             sp = want
-        elif abs(cur_sp - sp_ideal) <= self.sp_threshold:
+        elif abs(cur_sp - sp_ideal) <= self.sp_threshold(urgency):
             sp = cur_sp                      # near enough — let the fine actuators trim
         elif dwell_left > 0:
             sp, blocked = cur_sp, True       # pacing the compressor
         else:
             sp = want
         sp = int(max(lo, min(hi, sp)))
-        if cur_sp is None or sp != cur_sp:
-            self._last_sp_at = now
+        # NOTE: the dwell clock is stamped by the caller once the command is really
+        # issued, not here. Stamping on "my chosen setpoint differs from the
+        # device's" burned the dwell on moves that never happened — during a guard
+        # override, or while the unit was off — so the compressor pacing was spent
+        # before the controller got the room back.
 
         # --- fine: the blower takes the residual ------------------------------
         # With a fitted gain the level is computed outright. Without one the
@@ -175,8 +224,6 @@ class SplitRange:
         # not outrank a limit the room has been given (a quiet window starting, or
         # the guard handing 高 back).
         b = max(0, min(b_max, b))
-        if b != cur_b:
-            self._last_blower_at = now
 
         # --- finest: the fan carries what is left -----------------------------
         trim = (sp - b * g) - u_raw

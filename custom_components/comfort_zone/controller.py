@@ -18,15 +18,14 @@ signal path and no arms to trade places:
 ``u`` is a continuous virtual setpoint in °C: the value the unit would be given if
 it accepted fractions. :mod:`split` turns it into the three actuators it really has.
 
-**Power takes no part in any decision.** The meter is whole-house and shared with
-every other room, so this room's step is a minority of the signal; in the 2.2 h
-after v4 went live, all four escalations the power veto triggered were wrong, and
-one of them cooled the room 1.7 °C into a guard trip. One threshold could not serve
-both "engaged" and "unresponsive" either, so fixing a false positive mechanically
-created a false negative. A PI controller needs no engagement detector: persistent
-error *is* the evidence that a command did not take, and the integrator answers it
-in proportion instead of through a binary veto that can outrank the model. Power
-survives as a number on the card.
+**Power is a bounded feedforward, never a veto.** The meter is whole-house, and the
+v1–v4 *engagement detector* that read it as "did my command take?" was wrong four
+times out of four — one threshold cannot serve both "engaged" and "unresponsive", so
+fixing a false positive mechanically created a false negative. That is gone and is
+not coming back: persistent error is the evidence a command did not take, and the
+integrator answers it in proportion. What power is used for now is a different
+question — "what is about to happen to the room?" — answered as a small capped bias
+on the feedforward that no decision hangs on. See :mod:`power`.
 
 **Setpoint writes are stateless.** ``u`` is absolute and recomputed every tick, so
 the command is simply "write it if it differs from what the unit reports". The
@@ -48,20 +47,18 @@ from .const import (
     MODE_FAILSAFE,
     MODE_FAN_ASSIST,
     MODE_IDLE,
-    MODE_MANAGED_OFF,
 )
 from .pi import PiController
+from .power import PowerLead
 from .split import SplitRange
 
-# How far above the setpoint ceiling the demand must sit, and for how long, before
-# the AC is switched off outright. The loop has run out of warm actuator: it is
-# asking for a setpoint the unit does not have. Deliberately patient — cutting power
-# is the most disruptive thing this controller can do, and the room is cold already.
-MANAGED_OFF_MARGIN = 0.5
-MANAGED_OFF_AFTER_MIN = 10.0
 # How much of the band the loop actively holds. Correcting only as far as the band
 # edge is the classic dead-band failure — the load pushes the room straight back out
-# and the loop cycles on the boundary — so the zone it returns to sits half-way in.
+# and the loop cycles on the boundary — so the zone it returns to sits inside it.
+#
+# Half the band: inside it the loop does nothing, so the band stays the knob that
+# trades comfort against compressor motion. What makes a wide zone safe is not
+# shrinking it but what happens at its edge — see zone_error.
 INNER_ZONE_FRAC = 0.5
 # How close to a deliverable limit counts as sitting ON it.
 #
@@ -113,7 +110,6 @@ class ZoneParams:
     blower_levels: list[str]
     fan_min_level: int
     fan_max_level: int              # 0 = no fan in this window
-    managed_off_max_min: float
     blower_gain: float = 0.0        # °C of equivalent setpoint per blower level
     fan_assist_enabled: bool = True
     # Quiet limits, resolved for the window in force. The rail guard is deliberately
@@ -164,10 +160,13 @@ class Controller:
         self.predictor = predictor
         self.pi = PiController(predictor.params)
         self.split = SplitRange(predictor.params)
+        self.power = PowerLead()
         self._last_tick_at: datetime | None = None
         self._last_ff: float | None = None
-        self._managed_off_since: datetime | None = None
-        self._over_ceiling_since: datetime | None = None
+
+    def note_setpoint_change(self, at: datetime) -> None:
+        """Told by the caller when the UNIT's setpoint actually changed."""
+        self.power.note_setpoint_change(at)
 
     def zone(self, p: ZoneParams) -> tuple[float, float]:
         """The inner comfort zone the loop actively holds.
@@ -205,16 +204,26 @@ class Controller:
 
     @staticmethod
     def zone_error(settled: float, lo: float, hi: float) -> float:
-        """Distance to the nearest edge, and exactly zero inside.
+        """Zero inside the zone; outside, the distance to its CENTRE.
+
+        The step at the boundary is deliberate and is the whole point. Measuring to
+        the *edge* means the loop leaves the zone with an error of nearly nothing
+        and has to wait for the room to travel before it responds at all — on
+        08-07 that was fourteen minutes and a full degree, because the error
+        entered at 0.02 °C and the integral had to build from zero at 0.024 °C/min.
+
+        Measuring to the centre means the moment the room is out, the loop is
+        already asking to bring it properly back, not merely to the edge it just
+        crossed. That also removes the classic dead-band limit cycle for free: a
+        recovery that stops at the edge gets pushed straight back out, a recovery
+        aimed at the centre does not.
 
         Sign matches the point-tracking convention: positive means the room needs
         to be warmer, so the setpoint rises.
         """
-        if settled > hi:
-            return hi - settled
-        if settled < lo:
-            return lo - settled
-        return 0.0
+        if lo <= settled <= hi:
+            return 0.0
+        return (lo + hi) / 2.0 - settled
 
     def tick(self, s: Signals, p: ZoneParams) -> Command:
         dt_min = 0.0
@@ -250,14 +259,42 @@ class Controller:
                 else (p.setpoint_min + p.setpoint_max) / 2.0
         self._last_ff = ff
 
+        # --- leading indicator: what the meter says is about to happen ---------
+        # Added to the FEEDFORWARD, not the feedback: it is a prediction of a
+        # disturbance, in the same currency and with the same bounded authority as
+        # the weather. The loop remains free to overrule it.
+        self.power.observe(s.now, s.power, s.ac_on)
+        p_bias, p_why = self.power.bias(s.now, s.power, s.ac_on)
+        ff += p_bias
+
         # --- feedback: the residual, on the dead-time-free error ---------------
         lo, hi = self.split.deliverable(p)
-        frozen = s.guard_active or not s.ac_on or self._managed_off_since is not None
+        frozen = s.guard_active or not s.ac_on
         out = self.pi.step(error=error, u_ff=ff, dt_min=dt_min,
                            lo=lo, hi=hi, frozen=frozen)
 
+        # NEVER ASK FOR A COLDER SETPOINT WHILE THE THERMOMETER SAYS THE ROOM IS
+        # ALREADY COLD. `settled` can sit above the zone during a recovery purely
+        # because the model believes warming it has already commanded is on the
+        # way — and it believes that on the strength of `gain_per_step`, a PRIOR
+        # set deliberately at the top of its plausible range. That constant DIVIDES
+        # into Kc, where guessing high is gentle, but it MULTIPLIES in
+        # remaining_effect, where guessing high is aggressive and points at the
+        # cold. The two uses want opposite errors. Between a model that may be
+        # wrong about what is coming and a thermometer reading where the room is
+        # now, the thermometer wins.
+        cold_veto = y < zone_lo and s.setpoint is not None and out.u_raw < s.setpoint
+        if cold_veto:
+            out.u_raw = max(out.u_raw, float(s.setpoint))
+            out.u = max(out.u, min(hi, float(s.setpoint)))
+
         # --- output stage ------------------------------------------------------
-        sp = self.split.resolve(out.u_raw, s.now, s.setpoint, s.blower_idx, p, s.fan_on)
+        # How far the ROOM is outside its zone, which is what makes a setpoint
+        # move urgent. Measured on the reading, not the prediction: the predictor
+        # can believe help is coming while the thermometer keeps falling.
+        urgency = max(0.0, zone_lo - y, y - zone_hi)
+        sp = self.split.resolve(out.u_raw, s.now, s.setpoint, s.blower_idx, p,
+                                s.fan_on, urgency)
         # Pinned at a limit, and by how much the demand still exceeds it. The first
         # is the state worth reporting; the second is transient detail (see LIMIT_EPS).
         at_floor = out.u <= lo + LIMIT_EPS
@@ -280,37 +317,37 @@ class Controller:
             else "ceiling" if at_ceiling else None,
             "shortfall": shortfall, "frozen": out.frozen,
             "sp": sp.setpoint, "trim": sp.trim, "blower": sp.blower_idx,
+            "urgency": urgency, "cold_veto": cold_veto,
             "sp_dwell_left": sp.sp_dwell_left,
             "sp_blocked_by_dwell": sp.sp_blocked_by_dwell,
             "hi": p.target + p.band_high, "lo": p.target - p.band_low,
             "outdoor": s.outdoor,
+            "power_bias": p_bias, "power_baseline": p_why["baseline"],
+            "power_deviation": p_why["deviation"], "power_quiet": p_why["quiet"],
             "deliverable": [lo, hi],
             "gain": m.gain_per_step, "dead_time": m.dead_time_min, "tau": m.tau_min,
             "kc": m.kc, "ti": m.ti_min, "blower_gain": p.blower_gain,
             "sp_observed": s.setpoint,
         }
 
-        # === managed-off: the loop has run out of warm actuator ================
-        if self._managed_off_since is not None:
-            return self._managed_off(cmd, s, p, y, zone_lo)
-        if self._wants_managed_off(s, p, out.u_raw, y, zone_lo):
-            self._managed_off_since = s.now
-            self.pi.reset()
-            cmd.set_ac_power = False
-            cmd.set_fan = False
-            cmd.mode = MODE_MANAGED_OFF
-            cmd.branch = "managed_off.enter"
-            cmd.reason = (f"cold ({y:.2f}) and asking for setpoint {out.u_raw:.1f}, "
-                          f"above the ceiling {p.setpoint_max} → AC off (auto-returns)")
-            return cmd
-
+        # === the unit is off ==================================================
+        # THE CONTROLLER NEVER POWERS THE AC ON. Not when the room is warm, not
+        # when it is hot, not ever. An off unit is a person's decision, and on
+        # 08-07 this branch reversed one within a single tick in a room already a
+        # degree below its zone. The only thing permitted to restore power is the
+        # safety guard, putting back what the safety guard itself cut — see
+        # safety.SafetyGuard, which owns AC power outright.
+        #
+        # There is no managed-off here any more either, for the same reason: a
+        # controller that can switch the compressor off needs a way to switch it
+        # back on, and it is not allowed one. The sustained-cold guard covers what
+        # managed-off was for, and it can restore power because it cut it.
         if not s.ac_on:
-            cmd.set_ac_power = True
-            cmd.set_setpoint = sp.setpoint
-            cmd.mode = MODE_COOLING
-            cmd.branch = "ac.on"
-            cmd.reason = f"AC off → power on at setpoint {sp.setpoint}"
-            self._apply_fine(cmd, s, p, sp)
+            cmd.mode = MODE_IDLE
+            cmd.branch = "ac.off"
+            cmd.reason = (f"the unit is off — leaving it off (room {y:.2f}); "
+                          f"only the safety guard may restore power")
+            self._fan_only(cmd, s, p, sp)
             return cmd
 
         # === normal regulation =================================================
@@ -346,37 +383,12 @@ class Controller:
         return cmd
 
     # -- helpers ------------------------------------------------------------
-    def _wants_managed_off(self, s: Signals, p: ZoneParams, u_raw: float,
-                           y: float, target: float) -> bool:
-        """Has the demand sat above the setpoint ceiling long enough to cut power?"""
-        if not s.ac_on or y >= target:
-            self._over_ceiling_since = None
-            return False
-        if u_raw <= p.setpoint_max + MANAGED_OFF_MARGIN:
-            self._over_ceiling_since = None
-            return False
-        if self._over_ceiling_since is None:
-            self._over_ceiling_since = s.now
-            return False
-        return (s.now - self._over_ceiling_since).total_seconds() / 60.0 >= MANAGED_OFF_AFTER_MIN
-
-    def _managed_off(self, cmd: Command, s: Signals, p: ZoneParams,
-                     y: float, target: float) -> Command:
-        off_for = (s.now - self._managed_off_since).total_seconds() / 60.0
-        if y >= target or off_for >= p.managed_off_max_min:
-            self._managed_off_since = None
-            self._over_ceiling_since = None
-            cmd.set_ac_power = True
-            cmd.set_setpoint = int(max(p.setpoint_min, min(p.setpoint_max, round(p.target))))
-            cmd.mode = MODE_COOLING
-            cmd.branch = "managed_off.return"
-            cmd.reason = (f"managed-off return: comfort {y:.2f} ≥ target {target:.2f}"
-                          if y >= target else f"managed-off watchdog after {off_for:.0f}m")
-        else:
-            cmd.mode = MODE_MANAGED_OFF
-            cmd.branch = "managed_off.wait"
-            cmd.reason = f"AC off, waiting to warm to {target:.2f} (now {y:.2f})"
-        return cmd
+    def _fan_only(self, cmd: Command, s: Signals, p: ZoneParams, sp) -> None:
+        """The circulation fan is not the AC and keeps working while it is off."""
+        if sp.fan_on != s.fan_on:
+            cmd.set_fan = sp.fan_on
+        if sp.fan_on and (s.fan_level is None or abs(s.fan_level - sp.fan_level) >= 3):
+            cmd.set_fan_level = sp.fan_level
 
     def _apply_fine(self, cmd: Command, s: Signals, p: ZoneParams, sp) -> None:
         """Emit the blower and fan commands, only where they differ from the device."""

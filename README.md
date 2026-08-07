@@ -45,8 +45,13 @@ calms down on its own.
 ## Status
 
 v5 — control core, Home Assistant integration, and a custom Lovelace card with a
-drag-a-curve schedule editor. See `docs/DESIGN.md` for the design and the measured
-results, and `docs/REDESIGN.md` for the proposal it was built from.
+drag-a-curve schedule editor.
+
+- `docs/DESIGN.md` — the design, the evidence behind each choice, what has
+  already been tried and failed, and the open questions.
+- `docs/SIGNALS.md` — every signal the controller can see, how each is used,
+  what bounds it, and the clues that are still unexploited.
+- `docs/REDESIGN.md` — the proposal v5 was built from.
 
 ## Development
 

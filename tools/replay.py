@@ -41,7 +41,7 @@ from dotenv import load_dotenv
 
 from comfort_zone.controller import Controller, Signals, ZoneParams
 from comfort_zone.model import FopdtPredictor, ModelParams
-from comfort_zone.safety import SafetyGuard, SafetyParams, effective_rails
+from comfort_zone.safety import SafetyGuard, SafetyParams, rails as configured_rails
 
 # Where HA_URL / HA_TOKEN come from. Both tools talk to a live Home Assistant over
 # its REST API; neither stores a credential. Override the dotenv location with
@@ -208,7 +208,7 @@ def zone_params(tgt, a):
         no_fan_offset=0.2,
         setpoint_min=a.setpoint_min, setpoint_max=a.setpoint_max,
         blower_levels=BLOWERS, fan_min_level=10, fan_max_level=30,
-        managed_off_max_min=30, blower_gain=a.blower_gain,
+        blower_gain=a.blower_gain,
     )
 
 
@@ -256,7 +256,7 @@ def replay_window(hist, t0, t1, a, label=""):
         # pivot about --ff-ref: hold the curve's value there, change only its slope
         params.ff_intercept += (params.ff_per_outdoor - a.ff_per_outdoor) * a.ff_ref
         params.ff_per_outdoor = a.ff_per_outdoor
-    rails = effective_rails(target_of(grid[0]), a.band_low, a.band_high,
+    rails = configured_rails(target_of(grid[0]), a.band_low, a.band_high,
                             a.hard_min, a.hard_max)
 
     # ---- 1. recorded baseline (ground truth) ------------------------------
@@ -458,19 +458,26 @@ def main() -> int:
     if a.summary and results:
         print(f"\nband ±({a.band_low}, {a.band_high})   K {a.gain}"
               f"   setpoint {a.setpoint_min}–{a.setpoint_max}")
-        print(f"  {'window':18s} {'recorded':>9s} {'new core':>9s} {'rms':>14s} {'moves/h':>16s}")
+        print(f"  {'window':18s} {'recorded':>9s} {'new core':>9s} {'rms':>14s} "
+              f"{'moves/h':>16s} {'worst cold':>11s}")
         for r in results:
             print(f"  {r['label']:18s} {r['base']['in_band_pct']:8.1f}% "
                   f"{r['new']['in_band_pct']:8.1f}% "
                   f"{r['base']['rms_err']:6.3f} → {r['new']['rms_err']:5.3f} "
-                  f"{r['rec_moves'] / r['hours']:8.1f} → {r['sim_moves'] / r['hours']:5.1f}")
+                  f"{r['rec_moves'] / r['hours']:8.1f} → {r['sim_moves'] / r['hours']:5.1f} "
+                  f"{r['base']['worst_cold']:5.2f} → {r['new']['worst_cold']:4.2f}")
         n = len(results)
+        # The worst cold excursion is reported as the WORST across windows, not the
+        # mean: it is a safety number, and averaging it away is how a single bad
+        # night hides behind five good ones.
         print(f"  {'MEAN':18s} {sum(r['base']['in_band_pct'] for r in results) / n:8.1f}% "
               f"{sum(r['new']['in_band_pct'] for r in results) / n:8.1f}% "
               f"{sum(r['base']['rms_err'] for r in results) / n:6.3f} → "
               f"{sum(r['new']['rms_err'] for r in results) / n:5.3f} "
               f"{sum(r['rec_moves'] / r['hours'] for r in results) / n:8.1f} → "
-              f"{sum(r['sim_moves'] / r['hours'] for r in results) / n:5.1f}")
+              f"{sum(r['sim_moves'] / r['hours'] for r in results) / n:5.1f} "
+              f"{max(r['base']['worst_cold'] for r in results):5.2f} → "
+              f"{max(r['new']['worst_cold'] for r in results):4.2f}  (worst)")
         return 0
 
     if results:

@@ -45,7 +45,7 @@ OPT_COMFORT_RH_REF: Final = "comfort_rh_ref"       # anchor RH (signal == raw te
 # The band is NOT a control input. A PI controller tracks the target; there is no arm
 # that waits for an edge to be crossed. The band's two remaining jobs are to define
 # the fit metric the whole design is optimised for, and to keep the safety rails clear
-# of ordinary tracking ripple (see RAIL_BAND_CLEARANCE). Widening it is still the
+# of ordinary tracking ripple (see RAIL_RIPPLE). Widening it is still the
 # user's knob for trading fit against compressor motion — it just acts by changing
 # what counts as a miss, rather than by opening a deadband the controller sits inside.
 OPT_BAND_LOW: Final = "band_low"                   # °C below target
@@ -78,7 +78,6 @@ OPT_HARD_MIN: Final = "hard_min"                   # absolute comfort_temp floor
 OPT_HARD_MAX: Final = "hard_max"                   # absolute comfort_temp ceiling, °C
 OPT_SAFETY_MARGIN: Final = "safety_margin"         # wide margin beyond band for guard, °C
 OPT_SAFETY_COOLDOWN_MIN: Final = "safety_cooldown_min"
-OPT_MANAGED_OFF_MAX_MIN: Final = "managed_off_max_min"  # watchdog: force return after this
 
 # ---------------------------------------------------------------------------
 # Fitted model constants — written by tools/fit.py and reviewed by a human.
@@ -101,11 +100,11 @@ MK_BLOWER_GAIN: Final = "blower_gain"
 # never stored, so they cannot drift out of step with the plant they came from.
 MK_TAU_C_MULT: Final = "tau_c_mult"
 
-# A safety rail must sit at least this far outside the comfort band. A rail inside the
-# band's own tracking ripple is not a backstop but a second controller, and a cruder
-# one — its only move is to cut the compressor. Set from measured ripple: the dips that
-# tripped the cold rail 12 times in 4.5 h on 08-06 ran 0.1–0.45 °C past the band floor.
-RAIL_BAND_CLEARANCE: Final = 0.6
+# How close a rail may sit to the band before the ripple of ordinary tracking starts
+# tripping it. Used ONLY to warn: the configured rails are enforced exactly as set.
+# Measured 08-06 — a cold rail 0.2 °C under the band floor cut AC power 12 times in
+# 4.5 h on dips of 0.1–0.45 °C, and each cut cost a full setpoint walk back down.
+RAIL_RIPPLE: Final = 0.3
 # Bounds enforced when loading from storage, so a value written under older rules can
 # never persist out of range. GAIN_MIN is deliberately not tiny: it divides into Kc,
 # so a gain set too low yields an over-aggressive loop rather than an obviously broken
@@ -213,7 +212,6 @@ OPTION_DEFAULTS: Final = {
     OPT_HARD_MAX: 29.0,
     OPT_SAFETY_MARGIN: 1.4,
     OPT_SAFETY_COOLDOWN_MIN: 12,
-    OPT_MANAGED_OFF_MAX_MIN: 30,
 }
 
 # Default flat schedule if the user hasn't drawn one yet (48 × 30-min points).

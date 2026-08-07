@@ -45,7 +45,6 @@ from .const import (
     OPT_FAN_MIN_LEVEL,
     OPT_HARD_MAX,
     OPT_HARD_MIN,
-    OPT_MANAGED_OFF_MAX_MIN,
     OPT_NIGHT_END,
     OPT_NIGHT_START,
     OPT_SAFETY_COOLDOWN_MIN,
@@ -56,10 +55,10 @@ from .const import (
     TICK_SECONDS,
     UNAVAILABLE_STATES,
 )
-from .controller import Controller, Signals, ZoneParams
+from .controller import Command, Controller, Signals, ZoneParams
 from .model import FopdtPredictor, ModelParams, recent_power_change
 from .options import MODE_KEYS, resolve
-from .safety import SafetyGuard, SafetyParams, effective_rails
+from .safety import FAILSAFE_SETPOINT, SafetyGuard, SafetyParams, rails, warn_if_inside_band
 from .store import ZoneStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,17 +69,26 @@ SLOPE_WINDOW_MIN = 5.0
 # a value present but merely quiet only freezes control, it does not disrupt.
 STALE_AFTER_S = 1200
 # The card's power arrow looks back this far. Short, because it annotates a live
-# reading and has to agree with it. Power is display only — it is a whole-house
-# meter and no control decision reads it.
+# reading and has to agree with it. This is the DISPLAY window; the control-side
+# leading indicator keeps its own, much slower, baseline (see power.PowerLead).
 POWER_DISPLAY_WINDOW_MIN = 3.0
 # How far ahead the hourly forecast is carried. The reset curve only ever reads one
 # plant horizon out (~18 min), but the interpolator needs points either side of that.
 FORECAST_HOURS = 6
 # A no-action row is logged when the deciding branch changes, no faster than this.
 HOLD_LOG_MIN_INTERVAL_MIN = 3.0
+# While the room sits OUTSIDE its comfort zone, log at least this often even if
+# nothing is actuated and the branch never changes. A drift with no actions is the
+# state most worth reviewing afterwards and was previously the only one invisible.
+DRIFT_LOG_INTERVAL_MIN = 2.0
+# Largest setpoint jump we will believe from the unit in one tick. Bigger than any
+# command this controller issues (MAX step is one level at a time) and bigger than
+# the guard's blast, but small enough that a garbage reading cannot poison the
+# dead-time model for the next hour.
+MAX_CREDIBLE_SP_STEP = 5
 # Of the decision trace, what is worth persisting on every log row: enough to
 # re-judge the decision later without replaying the whole tick.
-LOG_TRACE_KEYS = ("y", "settled", "target", "error", "u_ff", "u_fb", "u", "u_raw",
+LOG_TRACE_KEYS = ("y", "settled", "target", "error", "urgency", "power_bias", "u_ff", "u_fb", "u", "u_raw",
                   "integral", "saturated", "frozen", "sp", "trim", "blower",
                   "hi", "lo", "outdoor", "sp_dwell_left", "sp_observed",
                   # the zone, and whether the room was inside it — without these a
@@ -145,6 +153,8 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         self._last_log_at = None
         self._last_branch: str = ""
         self._last_hold_log_at = None
+        self._last_drift_log_at = None
+        self._last_rail_warning: str | None = None
 
     # -- lifecycle ----------------------------------------------------------
     async def async_prepare(self) -> None:
@@ -164,6 +174,32 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         self._controller = Controller(self._predictor)
 
     async def async_set_enabled(self, value: bool) -> None:
+        """Switching off means stop deciding — it must not mean freeze an override.
+
+        The disabled path returns before the guard runs and before anything is
+        applied, so whatever was last commanded simply stays on the hardware. Turn
+        the zone off during an overheat blast and the unit sits at setpoint 22 with
+        the blower maxed indefinitely; turn it off during an overcool hold and the
+        AC stays off. Neither is what a person means by "off". So an override in
+        force is released once, on the way out.
+        """
+        if not value and self._safety.state != "normal":
+            releasing = self._safety.state
+            self._safety = SafetyGuard()
+            try:
+                d = self.entry.data
+                await apply(self.hass, Bindings(
+                    ac_climate=d[CONF_AC_CLIMATE],
+                    ac_power_switch=d.get(CONF_AC_POWER_SWITCH),
+                    fan=d.get(CONF_FAN),
+                    fan_speed_number=d.get(CONF_FAN_SPEED_NUMBER),
+                    blower_levels=self.blower_levels(),
+                ), Command(set_setpoint=FAILSAFE_SETPOINT, set_fan=False))
+                _LOGGER.info("%s: disabled during %s — released the override to "
+                             "setpoint %s", self.zone_name, releasing, FAILSAFE_SETPOINT)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("%s: could not release the %s override on disable: %s",
+                              self.zone_name, releasing, err)
         self.enabled = value
         await self.store.set_flag("enabled", value)
 
@@ -346,15 +382,31 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         band_low, band_high = self.bands(opts)
         # Resolved once, so the guard and the band the fit is measured against cannot
         # disagree about where the rails are.
-        hard_min, hard_max = effective_rails(
+        hard_min, hard_max = rails(
             target, band_low, band_high,
             float(opts[OPT_HARD_MIN]), float(opts[OPT_HARD_MAX]))
+        warn = warn_if_inside_band(target, band_low, band_high, hard_min, hard_max)
+        if warn and warn != self._last_rail_warning:
+            self._last_rail_warning = warn
+            _LOGGER.warning("%s: %s", self.zone_name, warn)
 
         # The plant responds to what the unit is actually running at, so a setpoint
         # the cloud proxy changed on its own is as real a step as one we commanded.
         if setpoint is not None and setpoint != self._observed_sp:
             if self._observed_sp is not None:
-                self._predictor.record_setpoint_change(now, setpoint - self._observed_sp)
+                # Bound the step before it reaches the predictor. A cloud proxy that
+                # glitches to 5 or 50 would otherwise inject a ±25 °C step, and
+                # `remaining_effect` would carry ±12 °C of imaginary in-flight
+                # cooling for the next fifty minutes — pinning the real setpoint at
+                # its floor whatever the room is doing.
+                step = max(-MAX_CREDIBLE_SP_STEP,
+                           min(MAX_CREDIBLE_SP_STEP, setpoint - self._observed_sp))
+                if step != setpoint - self._observed_sp:
+                    _LOGGER.warning("%s: unit reported setpoint %s from %s — "
+                                    "clamping the modelled step to %s",
+                                    self.zone_name, setpoint, self._observed_sp, step)
+                self._predictor.record_setpoint_change(now, step)
+                self._controller.note_setpoint_change(now)
             self._observed_sp = setpoint
             self._observed_sp_since = now
 
@@ -372,7 +424,6 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             # zone ever sanctions for its fan.
             fan_max_guard=int(max(opts[OPT_FAN_MAX_DAY], opts[OPT_FAN_MAX_NIGHT])),
             blower_max_idx=blower_max,
-            managed_off_max_min=float(opts[OPT_MANAGED_OFF_MAX_MIN]),
             blower_gain=model.blower_gain,
             fan_assist_enabled=self.fan_assist,
             hard_min=hard_min,
@@ -439,6 +490,10 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         actions: list[str] = []
         try:
             actions = await apply(self.hass, bindings, cmd)
+            # Start the compressor and blower dwells only for commands that were
+            # actually issued — see SplitRange.commit.
+            self._controller.split.commit(
+                now, cmd.set_setpoint is not None, cmd.set_blower_idx is not None)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("%s: failed to apply command: %s", self.zone_name, err)
 
@@ -453,10 +508,20 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         key = (cmd.branch, cmd.mode, tuple(actions))
         repeat = key == self._last_log_key and \
             self._last_log_at is not None and (now - self._last_log_at) < timedelta(minutes=5)
+        # A room drifting outside its zone must leave a trail even when nothing is
+        # actuated. Logging only on action or branch change hid the 08-07 failure
+        # completely: fourteen minutes, one unchanged branch, no rows, while the
+        # room fell 0.64 °C below its zone. Silence read exactly like "fine".
+        drifting = bool((cmd.trace or {}).get("urgency", 0.0) > 0.0)
+        heartbeat = drifting and (
+            self._last_drift_log_at is None
+            or (now - self._last_drift_log_at) >= timedelta(minutes=DRIFT_LOG_INTERVAL_MIN))
         new_arm = cmd.branch != self._last_branch and (
             self._last_hold_log_at is None
             or (now - self._last_hold_log_at) >= timedelta(minutes=HOLD_LOG_MIN_INTERVAL_MIN))
-        if (actions or new_arm) and not repeat:
+        if (actions or new_arm or heartbeat) and not repeat:
+            if heartbeat:
+                self._last_drift_log_at = now
             self._last_log_key = key
             self._last_log_at = now
             if not actions:
@@ -496,7 +561,7 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             "band_low": params.band_low,
             "band_high": params.band_high,
             # The rails actually in force, which are pushed out when a configured one
-            # sits inside the band (see safety.effective_rails).
+            # The configured rails, enforced exactly as set.
             "hard_min": params.hard_min,
             "hard_max": params.hard_max,
             "outdoor": signals.outdoor,
@@ -505,7 +570,7 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             "sp_held_min": (None if self._observed_sp_since is None else
                             (dt_util.utcnow() - self._observed_sp_since).total_seconds() / 60.0),
             "power": signals.power,
-            # Display only. Power is a whole-house meter and no decision reads it.
+            # The live reading, for the card's chip and arrow.
             "power_recent": dev["power_recent"],
             "setpoint": signals.setpoint,
             "fan_level": signals.fan_level,

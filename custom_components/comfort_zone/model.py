@@ -59,9 +59,8 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 def recent_power_change(history, now: datetime, window_min: float) -> float | None:
     """Change in the live power reading over the last ``window_min``, for display.
 
-    Power has no part in any control decision — it is a whole-house meter shared
-    with every other room, and every version that gated a setpoint on it was wrong
-    four times out of four. This is the card's arrow and nothing more.
+    Display only: this is the card's arrow. The control-side use of power is a
+    bounded feedforward with its own slow baseline — see :mod:`power`.
     """
     pts = [(t, v) for (t, v) in history if v is not None and t <= now]
     cut = now - timedelta(minutes=window_min)
@@ -115,9 +114,13 @@ class ModelParams:
             dead_time_min=_clamp(float(d[MK_DEAD_TIME]), DEAD_MIN, DEAD_MAX),
             tau_min=max(1.0, float(d[MK_TAU])),
             gain_per_step=_clamp(float(d[MK_GAIN]), GAIN_MIN, GAIN_MAX),
-            ff_intercept=float(d[MK_FF_INTERCEPT]),
-            ff_per_outdoor=float(d[MK_FF_PER_OUTDOOR]),
-            ff_per_target=float(d[MK_FF_PER_TARGET]),
+            # Clamped like everything else. These three are the largest lever on
+            # the commanded setpoint and were the only constants loaded raw, despite
+            # the promise above — a bad fit could put the feedforward anywhere, and
+            # the integral has only ±5 °C of authority to argue back with.
+            ff_intercept=_clamp(float(d[MK_FF_INTERCEPT]), -200.0, 200.0),
+            ff_per_outdoor=_clamp(float(d[MK_FF_PER_OUTDOOR]), -2.0, 0.0),
+            ff_per_target=_clamp(float(d[MK_FF_PER_TARGET]), 0.5, 5.0),
             blower_gain=max(0.0, float(d[MK_BLOWER_GAIN])),
             tau_c_mult=_clamp(float(d[MK_TAU_C_MULT]), TAU_C_MULT_MIN, TAU_C_MULT_MAX),
         )
