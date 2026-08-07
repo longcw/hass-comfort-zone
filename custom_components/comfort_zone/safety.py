@@ -33,6 +33,7 @@ from .const import (
     MODE_SAFETY_OVERCOOL,
     MODE_SAFETY_OVERHEAT,
     MODE_STALE_HOLD,
+    RAIL_BAND_CLEARANCE,
 )
 from .controller import Command, Signals, ZoneParams
 
@@ -47,6 +48,25 @@ STATE_OVERHEAT = "overheat"
 STATE_OVERCOOL = "overcool"
 STATE_STALE = "stale"
 STATE_FAILSAFE = "failsafe"
+
+
+def effective_rails(target: float, band_low: float, band_high: float,
+                    hard_min: float, hard_max: float) -> tuple[float, float]:
+    """Push the rails out until they clear the band they sit behind.
+
+    A rail inside the band's own tracking ripple is not a backstop — it is a second
+    controller, and a cruder one, because its only move is to cut the compressor.
+    Measured 08-06: hard_min 25.2 against a band floor of 25.4 cut AC power 12 times
+    in 4.5 h on dips of 0.1–0.45 °C, and each cut cost a full setpoint walk back down.
+    So a configured rail is honoured only where it is already outside the band by
+    RAIL_BAND_CLEARANCE; nearer than that, the rail moves, never the band, because
+    widening the band would silently change the temperature the room is held at.
+
+    Returns the rails to use for both the guard and the controller's deadband
+    trimming, which have to agree or the deadband opens into a trip.
+    """
+    return (min(hard_min, target - band_low - RAIL_BAND_CLEARANCE),
+            max(hard_max, target + band_high + RAIL_BAND_CLEARANCE))
 
 
 @dataclass
@@ -174,6 +194,9 @@ class SafetyGuard:
         # setpoint floor: at the hot rail it goes OVERHEAT_UNDERSHOOT below it to pull
         # the room back, clamped to what the unit will accept.
         blast = max(p.setpoint_device_min, p.setpoint_min - OVERHEAT_UNDERSHOOT)
+        # …and no more bound by a quiet cap than by that floor: the blower goes to the
+        # top of the ladder and the fan to the level the zone keeps for the guard.
+        guard_fan = p.fan_guard_level
         reason = (
             f"OVERHEAT guard: comfort {y:.2f} > hard_max {sp.hard_max:.1f} → full cool at {blast}"
             if y > sp.hard_max
@@ -185,8 +208,8 @@ class SafetyGuard:
             set_ac_power=True,
             set_setpoint=blast,
             set_blower_idx=top_blower,
-            set_fan=True,
-            set_fan_level=p.fan_max_level,
+            set_fan=True if guard_fan > 0 else None,
+            set_fan_level=guard_fan if guard_fan > 0 else None,
         )
 
     def _overcool_cmd(self, s: Signals, y: float, sp: SafetyParams,

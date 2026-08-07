@@ -17,10 +17,21 @@ if TYPE_CHECKING:
 
 async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool:
     """Set up a comfort zone from a config entry."""
+    from .const import OPT_STRATEGY, OPTION_DEFAULTS
     from .coordinator import ComfortZoneCoordinator
+    from .options import split_modal
 
     coordinator = ComfortZoneCoordinator(hass, entry)
     await coordinator.async_prepare()
+
+    # Entries written before modes were profiles keep every knob on the entry,
+    # where one tuned value shadowed all four modes. Hand them to the mode that
+    # was active — the values it was running become the values it now owns.
+    zone, knobs = split_modal(entry.options or {})
+    if knobs:
+        strategy = zone.get(OPT_STRATEGY, OPTION_DEFAULTS[OPT_STRATEGY])
+        await coordinator.store.set_knobs(strategy, {**coordinator.store.knobs(strategy), **knobs})
+        hass.config_entries.async_update_entry(entry, options=zone)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -48,22 +59,26 @@ async def _async_options_updated(hass: "HomeAssistant", entry: "ConfigEntry") ->
     the controller's dead-time timers. Rebinding entities (the reconfigure
     step) reloads on its own.
     """
+    from .const import OPT_STRATEGY
+
     coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if coordinator is None:  # a concurrent reload already replaced the zone
         return
     coordinator.async_update_listeners()  # options-flow edits show up now, not after the tick
-    await coordinator.async_request_refresh()
+    # A knob nudge rides the debouncer — the card's steppers fire in bursts and each
+    # tick costs a round trip to the AC's cloud API. A mode switch changes the target
+    # curve and every band at once, so it rebuilds the snapshot immediately instead
+    # of leaving the old numbers up for as long as a tick.
+    if (coordinator.data or {}).get("strategy") != coordinator.options()[OPT_STRATEGY]:
+        await coordinator.async_refresh()
+    else:
+        await coordinator.async_request_refresh()
 
 
 async def _async_register_services(hass: "HomeAssistant") -> None:
     """Register domain services once."""
-    if hass.services.has_service(DOMAIN, "identify_model"):
+    if hass.services.has_service(DOMAIN, "set_schedule"):
         return
-
-    from .system_id import async_identify_service
-
-    async def _identify(call):
-        await async_identify_service(hass, call)
 
     async def _set_schedule(call):
         """Persist a zone's 48-point target curve for its current strategy."""
@@ -78,7 +93,8 @@ async def _async_register_services(hass: "HomeAssistant") -> None:
                 await coord.store.set_schedule([float(x) for x in schedule], strat)
                 await coord.async_request_refresh()
 
-    hass.services.async_register(DOMAIN, "identify_model", _identify)
     hass.services.async_register(DOMAIN, "set_schedule", _set_schedule)
-    # Note: continuous self-evolution happens online in the coordinator
-    # (see adapt.OnlineAdapter). `identify_model` is a manual full-history refit.
+    # The model is fitted offline by tools/fit.py and reviewed by a human before it
+    # reaches const.MODEL_DEFAULTS. There is no service to refit it in place: a
+    # constant that changes without review is how a broken engagement rule ratcheted
+    # the dead time to 19 minutes and then paced every dwell off it.

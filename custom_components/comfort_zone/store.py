@@ -62,6 +62,19 @@ class ZoneStore:
         self._data.setdefault("schedules", {})[strategy] = list(schedule)[:SCHEDULE_POINTS]
         await self._save()
 
+    # -- knobs, per mode ----------------------------------------------------
+    def knobs(self, strategy: str) -> dict:
+        """What the user has tuned in this mode; its preset seeds the rest."""
+        return dict(self._data.get("knobs", {}).get(strategy, {}))
+
+    async def set_knob(self, strategy: str, key: str, value: float) -> None:
+        self._data.setdefault("knobs", {}).setdefault(strategy, {})[key] = float(value)
+        await self._save()
+
+    async def set_knobs(self, strategy: str, knobs: dict) -> None:
+        self._data.setdefault("knobs", {})[strategy] = dict(knobs)
+        await self._save()
+
     def target_at(self, hour: int, minute: int, strategy: str) -> float:
         idx = (hour * 60 + minute) // 30
         idx = max(0, min(SCHEDULE_POINTS - 1, idx))

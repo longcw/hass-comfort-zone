@@ -1,9 +1,3 @@
-identify_model:
-  name: Identify model
-  description: >-
-    Re-fit each comfort zone's control model (power lead, setpoint dead-time,
-    time-constant and gain) from the last 7 days of recorder history.
-
 set_schedule:
   name: Set schedule
   description: Persist a zone's 48-point (30-minute) target temperature curve.

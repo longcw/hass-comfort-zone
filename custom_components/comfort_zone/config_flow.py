@@ -19,6 +19,7 @@ from .const import (
     CONF_HUMIDITY_SENSOR,
     CONF_NAME,
     CONF_TEMP_SENSOR,
+    CONF_WEATHER,
     DOMAIN,
     OPT_COMFORT_K,
     OPT_COMFORT_RH_REF,
@@ -61,6 +62,8 @@ class ComfortZoneConfigFlow(ConfigFlow, domain=DOMAIN):
             vol.Optional(CONF_AC_POWER_SENSOR): _entity("sensor"),
             vol.Optional(CONF_FAN): _entity("fan"),
             vol.Optional(CONF_FAN_SPEED_NUMBER): _entity("number"),
+            # Outdoor temperature + hourly forecast for the reset curve.
+            vol.Optional(CONF_WEATHER): _entity("weather"),
         })
         return self.async_show_form(step_id="user", data_schema=schema)
 
@@ -118,6 +121,7 @@ class ComfortZoneConfigFlow(ConfigFlow, domain=DOMAIN):
             vol.Optional(CONF_AC_POWER_SENSOR, **d(CONF_AC_POWER_SENSOR)): _entity("sensor"),
             vol.Optional(CONF_FAN, **d(CONF_FAN)): _entity("fan"),
             vol.Optional(CONF_FAN_SPEED_NUMBER, **d(CONF_FAN_SPEED_NUMBER)): _entity("number"),
+            vol.Optional(CONF_WEATHER, **d(CONF_WEATHER)): _entity("weather"),
             vol.Optional(CONF_COMFORT_SENSOR, **d(CONF_COMFORT_SENSOR)): _entity("sensor"),
             vol.Optional(CONF_TEMP_SENSOR, **d(CONF_TEMP_SENSOR)): _entity("sensor"),
             vol.Optional(CONF_HUMIDITY_SENSOR, **d(CONF_HUMIDITY_SENSOR)): _entity("sensor"),

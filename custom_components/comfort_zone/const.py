@@ -26,6 +26,9 @@ CONF_AC_POWER_SWITCH: Final = "ac_power_switch"    # reliable on/off switch (NOT
 CONF_AC_POWER_SENSOR: Final = "ac_power_sensor"    # whole-system power (soft feedforward)
 CONF_FAN: Final = "fan"                            # circulation fan (optional)
 CONF_FAN_SPEED_NUMBER: Final = "fan_speed_number"  # non-lossy speed_level number (optional)
+# Outdoor temperature and hourly forecast, for the reset curve. Optional: without it
+# the loop runs on feedback alone, which is slower but converges to the same place.
+CONF_WEATHER: Final = "weather"
 
 # ---------------------------------------------------------------------------
 # Options (tunable at runtime via options flow / number entities / card)
@@ -37,22 +40,36 @@ OPT_SCHEDULE: Final = "schedule"                   # list[float] len 48 (30-min 
 OPT_COMFORT_K: Final = "comfort_k"                 # humidity weight, 0..1
 OPT_COMFORT_RH_REF: Final = "comfort_rh_ref"       # anchor RH (signal == raw temp here)
 
-# Band / setpoint envelope. The comfort band is ASYMMETRIC:
-#   [ target - band_low , target + band_high ]
-# The low (cold) side is the same regardless of the fan; the high (warm) side
-# tightens when fan-assist is off (no air movement to make warmth tolerable).
-OPT_BAND_LOW: Final = "band_low"                   # °C below target before easing
-OPT_BAND_HIGH: Final = "band_high"                 # °C above target before cooling (fan on)
-OPT_BAND_HIGH_NO_FAN: Final = "band_high_no_fan"   # warm-side tolerance when fan off (tighter)
+# The comfort band, asymmetric: [ target - band_low , target + band_high ].
+#
+# The band is NOT a control input. A PI controller tracks the target; there is no arm
+# that waits for an edge to be crossed. The band's two remaining jobs are to define
+# the fit metric the whole design is optimised for, and to keep the safety rails clear
+# of ordinary tracking ripple (see RAIL_BAND_CLEARANCE). Widening it is still the
+# user's knob for trading fit against compressor motion — it just acts by changing
+# what counts as a miss, rather than by opening a deadband the controller sits inside.
+OPT_BAND_LOW: Final = "band_low"                   # °C below target
+OPT_BAND_HIGH: Final = "band_high"                 # °C above target
+# Without air movement, warmth is less tolerable — which under a PI is a shift of the
+# TARGET, not a change of band. (As a band it silently widened the warm gate, which is
+# how the room parked at 27.25 on 07-26.) Lower the target by this much whenever no
+# fan can run, whether switched off or capped to zero for the window.
+OPT_NO_FAN_OFFSET: Final = "no_fan_offset"
 OPT_SETPOINT_MIN: Final = "setpoint_min"
 OPT_SETPOINT_MAX: Final = "setpoint_max"
 
-# Fan comfort layer.
+# Fan comfort layer. A cap of 0 means "no fan in this window" — the same as
+# switching fan-assist off, warm-side band included.
 OPT_FAN_MIN_LEVEL: Final = "fan_min_level"         # speed_level floor when on
 OPT_FAN_MAX_DAY: Final = "fan_max_day"
 OPT_FAN_MAX_NIGHT: Final = "fan_max_night"
 
-# Night window (fan caps + quieter behavior).
+# Highest AC blower the optimizer may use, as a ladder index: 0 = low, 1 = mid.
+# The ladder's top level stays reserved for the safety guard, which no cap binds.
+OPT_BLOWER_MAX_DAY: Final = "blower_max_day"
+OPT_BLOWER_MAX_NIGHT: Final = "blower_max_night"
+
+# Night window (the quiet caps above + quieter behavior).
 OPT_NIGHT_START: Final = "night_start"             # "HH:MM"
 OPT_NIGHT_END: Final = "night_end"
 
@@ -64,40 +81,67 @@ OPT_SAFETY_COOLDOWN_MIN: Final = "safety_cooldown_min"
 OPT_MANAGED_OFF_MAX_MIN: Final = "managed_off_max_min"  # watchdog: force return after this
 
 # ---------------------------------------------------------------------------
-# Fitted model constants (written by system-ID; config provides seeds)
+# Fitted model constants — written by tools/fit.py and reviewed by a human.
+# There is no online learning: it was not required, was not observed to help, and
+# its one measurable effect was a positive feedback loop through a learned dead time.
 # ---------------------------------------------------------------------------
 OPT_MODEL: Final = "model"                         # dict, see MODEL_DEFAULTS
-MK_DEAD_TIME: Final = "dead_time_min"              # L: command -> comfort starts moving
-MK_TAU: Final = "tau_min"                          # first-order time constant
-MK_GAIN: Final = "gain_per_step"                   # °C settled change per 1°C setpoint step
-MK_POWER_LEAD: Final = "power_lead_min"            # power leads comfort slope by this
-MK_ENGAGE_WATTS: Final = "engage_watts"            # Δpower that counts as "engaged"
-MK_ENGAGE_WINDOW: Final = "engage_window_min"      # how long to wait for engagement
-MK_LEAD: Final = "lead_min"                        # anticipation lead (LEARNED, bounded)
-MK_SP_MARGIN: Final = "sp_margin"                  # extra deadband beyond the comfort band before the SETPOINT moves (LEARNED)
+MK_DEAD_TIME: Final = "dead_time_min"              # θ: command -> comfort starts moving
+MK_TAU: Final = "tau_min"                          # τ: first-order time constant
+MK_GAIN: Final = "gain_per_step"                   # K: °C settled change per 1°C setpoint
+# Outdoor-reset curve: setpoint = intercept + per_outdoor·T_out + per_target·target
+MK_FF_INTERCEPT: Final = "ff_intercept"
+MK_FF_PER_OUTDOOR: Final = "ff_per_outdoor"
+MK_FF_PER_TARGET: Final = "ff_per_target"
+# °C of equivalent setpoint one AC blower level is worth. Zero means "not identified
+# as a temperature lever", and the output stage then drives it from saturation alone.
+MK_BLOWER_GAIN: Final = "blower_gain"
+# SIMC closed-loop time constant, as a multiple of the dead time. The single tuning
+# knob: larger is slower and more robust. Kc and Ti are derived from it (model.py),
+# never stored, so they cannot drift out of step with the plant they came from.
+MK_TAU_C_MULT: Final = "tau_c_mult"
 
-LEAD_CAP: Final = 5.0          # max anticipation lead the learner may reach (min)
-SP_MARGIN_CAP: Final = 0.6     # max setpoint deadband the learner may reach (°C)
-# Bounds on the learned params. Enforced both when learning AND when loading from
-# storage, so a value learned under older rules can never persist out of range.
-# GAIN_MIN is deliberately not tiny: with saturated episodes excluded from learning,
-# a 1 °C setpoint step that settles under 0.3 °C is not physically credible, and a
-# too-small gain makes the controller under-credit its own in-flight cooling and
-# over-escalate.
+# A safety rail must sit at least this far outside the comfort band. A rail inside the
+# band's own tracking ripple is not a backstop but a second controller, and a cruder
+# one — its only move is to cut the compressor. Set from measured ripple: the dips that
+# tripped the cold rail 12 times in 4.5 h on 08-06 ran 0.1–0.45 °C past the band floor.
+RAIL_BAND_CLEARANCE: Final = 0.6
+# Bounds enforced when loading from storage, so a value written under older rules can
+# never persist out of range. GAIN_MIN is deliberately not tiny: it divides into Kc,
+# so a gain set too low yields an over-aggressive loop rather than an obviously broken
+# one, and a 1 °C setpoint step that settles under 0.3 °C is not physically credible.
 GAIN_MIN: Final = 0.3
 GAIN_MAX: Final = 2.0
 DEAD_MIN: Final = 2.0
 DEAD_MAX: Final = 25.0
+TAU_C_MULT_MIN: Final = 0.5
+TAU_C_MULT_MAX: Final = 5.0
 
+# Fitted 2026-08-07 over 7 days (tools/fit.py). Read that module's docstring before
+# changing any of these — closed-loop history identifies some of them and not others.
 MODEL_DEFAULTS: Final = {
+    # NOT identified by the fit, and not identifiable from closed-loop history: the
+    # controller moves the setpoint because the room moved, so the regression recovers
+    # the controller's inverse (measured gain −0.04 °C/°C, and a blower that appeared
+    # to WARM the room). These three are the priors the old online adapter reported,
+    # with the gain taken at the TOP of its plausible range on purpose — it divides
+    # into Kc, so guessing high gives a gentler loop and guessing low an unstable one.
+    MK_GAIN: 0.5,
     MK_DEAD_TIME: 10.0,
     MK_TAU: 8.0,
-    MK_GAIN: 0.5,            # a 1°C setpoint drop settles ~0.5°C of comfort_temp
-    MK_POWER_LEAD: 6.0,
-    MK_ENGAGE_WATTS: 150.0,
-    MK_ENGAGE_WINDOW: 4.0,
-    MK_LEAD: 3.0,           # start with a little anticipation; the adapter tunes it
-    MK_SP_MARGIN: 0.25,     # start with a small setpoint deadband; the adapter tunes it
+    # Identified: regressing the old controller's own output on outdoor temperature,
+    # which is exogenous, is safe where regressing the room on that output is not.
+    # −0.21 °C of setpoint per outdoor °C, over a 24.6–33.2 °C span.
+    MK_FF_INTERCEPT: -21.52,
+    MK_FF_PER_OUTDOOR: -0.2107,
+    # Pinned by physics rather than fitted: steady state is y = c0 + c_out·T_out + K·sp,
+    # so holding the room 1 °C warmer takes exactly 1/K of setpoint. Fitting it gave
+    # 0.26, read off a target that never moved more than 0.5 °C in the whole week.
+    MK_FF_PER_TARGET: 2.0,
+    # Not identified — see above. The output stage falls back to driving the blower
+    # from saturation, which needs no gain.
+    MK_BLOWER_GAIN: 0.0,
+    MK_TAU_C_MULT: 1.5,
 }
 
 # ---------------------------------------------------------------------------
@@ -115,27 +159,33 @@ STRATEGY_PRESETS: Final = {
     STRATEGY_BABY: {
         OPT_BAND_LOW: 0.4,
         OPT_BAND_HIGH: 0.5,
-        OPT_BAND_HIGH_NO_FAN: 0.3,
+        OPT_NO_FAN_OFFSET: 0.2,
         OPT_FAN_MAX_DAY: 40,
         OPT_FAN_MAX_NIGHT: 25,
+        OPT_BLOWER_MAX_DAY: 1,
+        OPT_BLOWER_MAX_NIGHT: 1,
         OPT_SAFETY_MARGIN: 1.4,
         OPT_SAFETY_COOLDOWN_MIN: 12,
     },
     STRATEGY_ECO: {
         OPT_BAND_LOW: 0.5,
         OPT_BAND_HIGH: 0.9,
-        OPT_BAND_HIGH_NO_FAN: 0.6,
+        OPT_NO_FAN_OFFSET: 0.3,
         OPT_FAN_MAX_DAY: 70,
         OPT_FAN_MAX_NIGHT: 40,
+        OPT_BLOWER_MAX_DAY: 1,
+        OPT_BLOWER_MAX_NIGHT: 1,
         OPT_SAFETY_MARGIN: 1.6,
         OPT_SAFETY_COOLDOWN_MIN: 15,
     },
     STRATEGY_COMFORT: {
         OPT_BAND_LOW: 0.35,
         OPT_BAND_HIGH: 0.45,
-        OPT_BAND_HIGH_NO_FAN: 0.3,
+        OPT_NO_FAN_OFFSET: 0.15,
         OPT_FAN_MAX_DAY: 60,
         OPT_FAN_MAX_NIGHT: 35,
+        OPT_BLOWER_MAX_DAY: 1,
+        OPT_BLOWER_MAX_NIGHT: 1,
         OPT_SAFETY_MARGIN: 1.3,
         OPT_SAFETY_COOLDOWN_MIN: 10,
     },
@@ -149,12 +199,14 @@ OPTION_DEFAULTS: Final = {
     OPT_COMFORT_RH_REF: 55.0,
     OPT_BAND_LOW: 0.4,
     OPT_BAND_HIGH: 0.5,
-    OPT_BAND_HIGH_NO_FAN: 0.3,
+    OPT_NO_FAN_OFFSET: 0.2,
     OPT_SETPOINT_MIN: 24,
     OPT_SETPOINT_MAX: 27,
     OPT_FAN_MIN_LEVEL: 10,
     OPT_FAN_MAX_DAY: 40,
     OPT_FAN_MAX_NIGHT: 25,
+    OPT_BLOWER_MAX_DAY: 1,
+    OPT_BLOWER_MAX_NIGHT: 1,
     OPT_NIGHT_START: "22:00",
     OPT_NIGHT_END: "07:00",
     OPT_HARD_MIN: 23.0,

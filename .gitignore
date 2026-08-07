@@ -9,3 +9,6 @@ frontend/dist/
 *.log
 .DS_Store
 scratch/
+
+# local eval working doc (not committed)
+docs/EVAL.md
