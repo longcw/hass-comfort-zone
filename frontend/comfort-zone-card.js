@@ -1,11 +1,18 @@
 // comfort-zone-card.js
 // A Lovelace card for the Comfort Zone integration — an instrument panel for an
-// autonomous climate agent. It shows what the room feels like and what the
-// controller is doing (and why), lets you shape the day's target curve by
-// dragging, and streams the controller's recent decisions.
+// autonomous climate agent. It shows what the room feels like, the comfort zone
+// being held, what the loop is asking of the unit (and why), the meter's answer
+// to it, and lets you shape the day's target curve by dragging it.
 //
 // Dependency-free vanilla custom element (no Lit, no build step, no CDN — HA
 // blocks external imports). Register as a Lovelace module resource.
+//
+// Three layers, and nothing crosses them:
+//   viewModel(hass, config, cache)  — the only place that reads hass. Pure.
+//   render*(vm)                     — pure HTML strings, one island each, written
+//                                     only when the island's signature changes.
+//   ScheduleEditor                  — the one stateful component: it owns its
+//                                     draft, its selection and its listeners.
 //
 // Config:
 //   type: custom:comfort-zone-card
@@ -23,7 +30,7 @@
 // where the registry is available, with entity-id substitution as a fallback.
 
 (() => {
-  const VERSION = "0.1.0";
+  const VERSION = "0.3.1";
 
   // --- semantic palette (mid-chroma so it reads on light AND dark surfaces) ---
   const C = {
@@ -34,6 +41,7 @@
     amber: "#f5a623",  // overheat caution
     danger: "#e5484d", // overcool danger / fail-safe
     ok: "#35c07a",     // idle / on target
+    out: "#8b7fd4",    // outdoor overlay — its own axis, so its own colour
   };
 
   const MODES = {
@@ -44,6 +52,7 @@
     managed_off: { label: "AC off", color: C.grey },
     safety_overheat: { label: "Overheat guard", color: C.amber },
     safety_overcool: { label: "Overcool guard", color: C.danger },
+    stale_hold: { label: "Sensor stale", color: C.amber },
     failsafe: { label: "Fail-safe", color: C.danger },
     disabled: { label: "Disabled", color: C.grey },
   };
@@ -51,10 +60,29 @@
   const STRATEGIES = ["baby", "eco", "comfort", "custom"];
   const DEF_TMIN = 25, DEF_TMAX = 27; // default y-axis range (°C); override with curve_min/curve_max
   const SLOTS = 48;             // 30-min slots
+  // The chart window clips what is DRAWN. Edits span the whole sensible room
+  // range, so a value from outside the window can still be nudged back into it.
+  const EDIT_MIN = 16, EDIT_MAX = 32;
+  // Hours of meter history under the chart. Short on purpose: this strip is read
+  // against the setpoint ticks drawn on it, and at six hours the changes crowded
+  // together until most of their labels had to be suppressed to avoid overlapping.
+  const POWER_HOURS = 3;
 
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const snap = (v, step) => Math.round(v / step) * step;
   const fnum = (v) => (v === null || v === undefined || v === "" || isNaN(+v) ? null : +v);
+
+  // Every interpolated value goes through this. Reasons, branch ids, friendly
+  // names and entity ids all come from outside and all land inside markup.
+  const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  const esc = (v) => (v === null || v === undefined ? "" : String(v).replace(/[&<>"']/g, (c) => ESC[c]));
+
+  // Readouts of the controller's own numbers. Signed where the sign carries
+  // meaning (an error, a rate) and fixed-width so the panel's rows line up.
+  const f1 = (v) => (fnum(v) == null ? "–" : (+v).toFixed(1));
+  const f2 = (v) => (fnum(v) == null ? "–" : (+v).toFixed(2));
+  const sg2 = (v) => (fnum(v) == null ? "–" : (v >= 0 ? "+" : "") + (+v).toFixed(2));
+  const sg3 = (v) => (fnum(v) == null ? "–" : (v >= 0 ? "+" : "") + (+v).toFixed(3));
 
   // Blower level names shown in the UI. Units label the same three speeds every
   // which way (低风/弱风/Low/Quiet …); display one consistent set regardless of
@@ -74,7 +102,907 @@
     return BLOWER_LABELS[k] ?? BLOWER_LABELS[k.toLowerCase()] ?? v;
   };
 
-  // ---------------------------------------------------------------------------
+  // ===========================================================================
+  // Entity resolution
+  // ===========================================================================
+  // Each key is claimed by an entity-id pattern first (authoritative — HA
+  // slugifies the entity's name into its id) and only then by a friendly-name
+  // pattern. Both sets are mutually exclusive within a domain, so no key depends
+  // on the order the registry happens to hand entities over in.
+  const RULES = {
+    sensor: [
+      ["comfort", /_comfort_temperature(_\d+)?$/, /comfort/],
+      ["target", /_target(_\d+)?$/, /target/],
+      ["predicted", /_predicted_settled(_\d+)?$/, /predict/],
+      ["slope", /_rate_of_change(_\d+)?$/, /rate of change|slope|变化/],
+    ],
+    switch: [
+      ["fanAssist", /_fan_assist(_\d+)?$/, /fan assist/],
+      ["enable", /_enabled(_\d+)?$/, /enabled/],
+    ],
+    select: [
+      ["strategy", /_strategy(_\d+)?$/, /strategy/],
+    ],
+    number: [
+      ["bandLow", /_band_low(_\d+)?$/, /band.*low/],
+      ["bandHigh", /_band_high(_\d+)?$/, /band.*high/],
+      ["noFanOffset", /_no_fan_offset(_\d+)?$/, /cooler when fan off|no.?fan/],
+      ["hardMin", /_hard_min(_\d+)?$/, /hard min/],
+      ["hardMax", /_hard_max(_\d+)?$/, /hard max/],
+      ["fanMaxNight", /_fan_max_night(_\d+)?$/, /fan max.*night/],
+      ["fanMaxDay", /_fan_max_day(_\d+)?$/, /fan max.*day/],
+    ],
+  };
+
+  // Memoized on the status entity's device plus how many entities that device
+  // owns — the pair changes exactly when the registry has something new to say,
+  // and scanning the registry on every hass tick was the card's hottest loop.
+  function resolveEntities(hass, statusId, cache) {
+    const reg = hass.entities || {};
+    const device = reg[statusId] ? reg[statusId].device_id : null;
+    const sibs = device ? Object.keys(reg).filter((id) => reg[id].device_id === device) : [];
+    const key = `${statusId}|${device || "-"}|${sibs.length}`;
+    if (cache.key === key) return cache.ent;
+
+    const out = { status: statusId };
+    const nameOf = (id) => String(hass.states[id]?.attributes?.friendly_name || "").toLowerCase();
+    for (const byName of [false, true]) {
+      for (const id of sibs) {
+        if (id === statusId) continue;
+        const rules = RULES[id.split(".")[0]];
+        if (!rules) continue;
+        const probe = byName ? nameOf(id) : id;
+        for (const [k, idRe, nameRe] of rules) {
+          if (out[k]) continue;
+          if ((byName ? nameRe : idRe).test(probe)) { out[k] = id; break; }
+        }
+      }
+    }
+
+    // Fallbacks by id substitution (the registry path above is preferred).
+    const slug = statusId.replace(/^sensor\./, "").replace(/_status$/, "");
+    out.comfort ||= `sensor.${slug}_comfort_temperature`;
+    out.target ||= `sensor.${slug}_target`;
+    out.predicted ||= `sensor.${slug}_predicted_settled`;
+    out.slope ||= `sensor.${slug}_rate_of_change`;
+    out.enable ||= `switch.${slug}_enabled`;
+    out.fanAssist ||= `switch.${slug}_fan_assist`;
+    out.strategy ||= `select.${slug}_strategy`;
+    out.bandLow ||= `number.${slug}_band_low`;
+    out.bandHigh ||= `number.${slug}_band_high`;
+    out.noFanOffset ||= `number.${slug}_no_fan_offset`;
+    out.fanMaxDay ||= `number.${slug}_fan_max_day`;
+    out.fanMaxNight ||= `number.${slug}_fan_max_night`;
+
+    // Zone name for the set_schedule service = friendly name minus " Status".
+    const fn = hass.states[statusId]?.attributes?.friendly_name || slug;
+    out.zoneName = fn.replace(/\s*status$/i, "").trim() || slug;
+
+    cache.key = key;
+    cache.ent = out;
+    return out;
+  }
+
+  // ===========================================================================
+  // View model — the one place that reads hass
+  // ===========================================================================
+  function viewModel(hass, config, cache) {
+    const zoneId = config.zone;
+    const status = hass.states[zoneId];
+    if (!status || status.state === "unavailable") {
+      return { ok: false, missing: `Waiting for ${zoneId}…` };
+    }
+    const a = status.attributes || {};
+    const em = a.entities || {};
+    const ent = resolveEntities(hass, zoneId, cache);
+    const st = (id) => (id ? hass.states[id] : undefined);
+    const num = (id) => fnum(st(id)?.state);
+
+    const enabled = a.enabled !== false;
+    const mode = enabled ? status.state : "disabled";
+    const meta = MODES[mode] || { label: mode, color: C.grey };
+
+    const comfort = num(ent.comfort);
+    const target = num(ent.target);
+    const bandLow = fnum(a.band_low) ?? 0.4;
+    const bandHigh = fnum(a.band_high) ?? bandLow;
+    // The loop holds a ZONE, not a point, and makes no correction inside it. It is
+    // narrower than the band, sits mid-band, and drops when no fan can run — so it
+    // is not the scheduled target and the hero must not pretend otherwise.
+    const zoneLo = fnum(a.zone_lo) ?? (target != null ? target - bandLow : null);
+    const zoneHi = fnum(a.zone_hi) ?? (target != null ? target + bandHigh : null);
+    const zoneMid = zoneLo != null && zoneHi != null ? (zoneLo + zoneHi) / 2 : target;
+    const onTarget = comfort != null && zoneLo != null && zoneHi != null
+      && comfort >= zoneLo && comfort <= zoneHi;
+
+    const outdoor = fnum(a.outdoor);
+    const slope = fnum(a.slope);
+    const power = em.power ? (num(em.power) ?? fnum(a.power)) : fnum(a.power);
+    // Short-window power trend. It annotates the live reading below it, so it
+    // tracks the same window; nothing in the loop reads power at all.
+    const recent = fnum(a.power_recent);
+
+    // AC and fan chips read LIVE from the device entities, falling back to the
+    // tick snapshot: the AC keeps cooling while the controller sits idle, and the
+    // difference between the two is worth seeing.
+    const acSt = st(em.ac);
+    const acOn = acSt ? !["off", "unavailable", "unknown"].includes(acSt.state) : a.ac_on;
+    const acState = acSt ? acSt.state : a.ac_state;
+    const acSetpoint = acSt ? fnum(acSt.attributes.temperature) : fnum(a.setpoint);
+    const acBlower = blowerLabel(acSt ? acSt.attributes.fan_mode : a.ac_blower);
+
+    const fanSt = st(em.fan);
+    const fanOn = fanSt ? fanSt.state === "on" : a.fan_on;
+    const fanLevel = em.fan_speed ? num(em.fan_speed) : fnum(a.fan_level);
+    const fanAssistSt = st(ent.fanAssist);
+    const fanAssist = fanAssistSt ? fanAssistSt.state === "on" : (a.fan_assist_enabled !== false);
+
+    const chip = (k, v, cls = "", entity = null) => ({ k, v, cls, entity });
+    // Power carries a short-window trend arrow; nothing in the loop reads power.
+    const powerChip = power == null ? null
+      : chip("power", `${(power / 1000).toFixed(power >= 1000 ? 1 : 2)}kW`, "", em.power);
+    if (powerChip && recent != null && Math.abs(recent) >= 200) {
+      powerChip.arrow = recent > 0 ? "up" : "dn";
+    }
+    const acChip = acOn
+      ? chip("ac", [acState && acState !== "cool" ? acState : "cool",
+        acSetpoint != null ? `${acSetpoint}°` : "", acBlower || ""].filter(Boolean).join(" "), "", em.ac)
+      : chip("ac", "off", "soft", em.ac);
+    // How long the unit has actually sat on this setpoint — the "is it fussing?"
+    // number, and the whole point of leaving the compressor alone. Measured from
+    // OBSERVED transitions, so it is null until one has been seen. Past the 6 min
+    // dwell the hold is real rather than incidental, and earns the calm colour.
+    const held = fnum(a.sp_held_min);
+    const heldChip = chip("held",
+      held == null ? "—" : held >= 60
+        ? `${Math.floor(held / 60)}h${String(Math.floor(held % 60)).padStart(2, "0")}m`
+        : `${Math.floor(held)}m`,
+      held == null ? "soft" : held >= 6 ? "calm" : "", em.ac);
+    const fanChip = !fanAssist ? chip("fan", "assist off", "soft", em.fan)
+      : a.fan_max_level === 0 ? chip("fan", "capped off", "soft", em.fan)
+      : fanOn ? chip("fan", fanLevel != null ? String(fanLevel) : "on", "", em.fan)
+      : chip("fan", "off", "soft", em.fan);
+
+    // The night chip names the caps it imposes: they are the reason the room is
+    // allowed to behave differently after lights-out.
+    const caps = [
+      a.fan_max_level === 0 ? "no fan" : a.fan_max_level != null ? `fan ≤${a.fan_max_level}%` : "",
+      a.blower_max ? `≤${blowerLabel(a.blower_max)}` : "",
+    ].filter(Boolean).join(" · ");
+
+    const chips = [
+      acChip,
+      heldChip,
+      fanChip,
+      powerChip,
+      // OUT opens the weather entity: HA's own dialog already draws the hourly
+      // forecast, which is the next question anyone asks of an outdoor reading.
+      outdoor != null ? chip("out", `${outdoor.toFixed(1)}°`, "", em.weather) : null,
+      slope != null ? chip("slope", `${slope >= 0 ? "+" : ""}${slope.toFixed(2)}`, "", ent.slope) : null,
+      a.strategy ? chip("strategy", a.strategy) : null,
+      a.is_night ? chip("", `☾ night${caps ? ` · ${caps}` : ""}`, "soft") : null,
+      a.safety_state && a.safety_state !== "normal" ? chip("safety", a.safety_state, "warn") : null,
+    ].filter(Boolean);
+
+    // Sensor freshness: when did the regulated source thermometer last report?
+    // (the controller freezes on a stale reading, so surfacing it is useful)
+    const freshEnt = em.comfort || em.temp || ent.comfort;
+    let fresh = null;
+    const fst = freshEnt ? hass.states[freshEnt] : null;
+    if (fst) {
+      const lu = (fst.last_reported && fst.last_reported > fst.last_updated)
+        ? fst.last_reported : fst.last_updated;
+      const d = lu ? new Date(lu) : null;
+      if (d && !isNaN(d)) {
+        const ageS = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+        const ago = ageS < 60 ? "just now"
+          : ageS < 3600 ? `${Math.floor(ageS / 60)}m ago`
+          : `${Math.floor(ageS / 3600)}h ${Math.floor((ageS % 3600) / 60)}m ago`;
+        const hhmmss = d.toLocaleTimeString([], {
+          hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+        fresh = { text: `updated ${hhmmss} · ${ago}`, stale: ageS > 20 * 60, entity: freshEnt };
+      }
+    }
+
+    const knob = (id, label, signed = false) => {
+      const s = st(id);
+      if (!s) return null;
+      return { id, label, signed, value: fnum(s.state),
+        unit: s.attributes.unit_of_measurement || "" };
+    };
+
+    const sched = a.schedule;
+    return {
+      ok: true,
+      title: config.title || ent.zoneName,
+      zoneName: ent.zoneName,
+      ent,
+      enabled,
+      mode,
+      modeColor: meta.color,
+      // "idle" already reads "On target"; don't double it up.
+      pillLabel: mode === "idle" ? meta.label : meta.label + (onTarget ? " · on target" : ""),
+      comfort, target, zoneLo, zoneHi, zoneMid, bandLow, bandHigh,
+      acBlower,
+      reason: a.reason || "",
+      branch: a.branch || "",
+      decision: a.decision && Object.keys(a.decision).length ? a.decision : null,
+      chips,
+      fresh,
+      feelEntity: em.comfort || em.temp || ent.comfort || zoneId,
+      goalEntity: em.status || zoneId,
+      historyEntity: em.comfort || ent.comfort,
+      weatherEntity: em.weather || null,
+      powerEntity: em.power || null,
+      acEntity: em.ac || null,
+      strategy: st(ent.strategy)?.state || a.strategy || "baby",
+      fanAssist: fanAssistSt ? { id: ent.fanAssist, on: fanAssist } : null,
+      // The fan caps sit next to the offset because a cap of 0 is what makes "no
+      // fan available" true, and the offset is what that then costs in degrees.
+      knobs: [
+        knob(ent.bandLow, "band low", true),
+        knob(ent.bandHigh, "band high"),
+        knob(ent.noFanOffset, "cooler w/o fan", true),
+        knob(ent.fanMaxDay, "fan day"),
+        knob(ent.fanMaxNight, "fan night"),
+      ].filter(Boolean),
+      schedule: Array.isArray(sched) && sched.length === SLOTS
+        ? sched.map(Number) : new Array(SLOTS).fill(26),
+    };
+  }
+
+  // ===========================================================================
+  // Render — pure, one string per island
+  // ===========================================================================
+  function renderHeader(vm, showWhy) {
+    const chips = vm.chips.map((c) => {
+      const clickable = c.entity ? ` data-action="more" data-entity="${esc(c.entity)}"` : "";
+      const arrow = c.arrow ? ` <span class="${c.arrow}">${c.arrow === "up" ? "▲" : "▼"}</span>` : "";
+      return `<div class="chip ${esc(c.cls)} ${c.entity ? "clk" : ""}"${clickable}>
+        ${c.k ? `<span class="k">${esc(c.k)}</span>` : ""}<span class="v">${esc(c.v)}${arrow}</span></div>`;
+    }).join("");
+
+    // The goal is a ZONE, and its centre is not the scheduled target: it sits
+    // mid-band (an asymmetric band would otherwise make the target hug its tight
+    // edge) and drops again when no fan can run. Show the schedule alongside and
+    // name whichever cause applies, rather than letting the numbers silently
+    // disagree.
+    const offset = vm.target != null && vm.zoneMid != null ? vm.zoneMid - vm.target : 0;
+    const mid = (vm.bandHigh - vm.bandLow) / 2 || 0;
+    const causes = [];
+    if (Math.abs(mid) > 0.005) causes.push("mid-band");
+    if (Math.abs(offset - mid) > 0.005) causes.push("no fan");
+    const schedNote = vm.target == null ? ""
+      : `<span class="band alt">sched ${f1(vm.target)}°${
+        causes.length ? ` · ${sg2(offset)} ${causes.join(" + ")}` : ""}</span>`;
+
+    const fresh = vm.fresh
+      ? `<div class="freshness clk${vm.fresh.stale ? " stale" : ""}" data-action="more"
+           data-entity="${esc(vm.fresh.entity)}">${esc(vm.fresh.text)}</div>` : "";
+
+    return `
+      <div class="hd-top">
+        <div class="zone card-header">${esc(vm.title)}</div>
+        <button class="toggle ${vm.enabled ? "on" : ""}" data-action="toggle"
+                title="${vm.enabled ? "Controller on" : "Controller off"}" role="switch"
+                aria-checked="${vm.enabled}"><span class="knob"></span></button>
+      </div>
+      <div class="hero">
+        <span class="feel clk" style="color:${C.warm}" data-action="more" data-entity="${esc(vm.feelEntity)}"
+          >${vm.comfort != null ? vm.comfort.toFixed(1) : "–"}<span class="deg">°</span></span>
+        <span class="arrow">→</span>
+        <span class="goal zone clk" style="color:${C.cool}" data-action="more" data-entity="${esc(vm.goalEntity)}"
+          >${vm.zoneLo != null ? vm.zoneLo.toFixed(1) : "–"}<span class="dash">–</span>${
+          vm.zoneHi != null ? vm.zoneHi.toFixed(1) : "–"}<span class="deg">°</span></span>
+        <span class="band">band −${vm.bandLow.toFixed(1)} / +${vm.bandHigh.toFixed(1)}</span>
+        ${schedNote}
+      </div>
+      <div class="statusline">
+        <span class="pill clk" style="--c:${vm.modeColor}" data-action="more"
+          data-entity="${esc(vm.feelEntity)}">${esc(vm.pillLabel)}</span>
+        <span class="reason">${esc(vm.reason)}</span>
+        ${vm.decision ? `<button class="whybtn" data-action="why"
+           aria-expanded="${showWhy}">why ${showWhy ? "▴" : "▾"}</button>` : ""}
+      </div>
+      ${showWhy ? renderWhy(vm) : ""}
+      ${fresh}
+      <div class="chips">${chips}</div>`;
+  }
+
+  // -- why: the causal chain, in the order the controller walks it --------------
+  //   outdoor → u_ff ·  error → u_fb ·  u_ff + u_fb = u_raw ·  clamp → u
+  //   ·  quantise → setpoint + blower + fan
+  // The reason line says what it decided; this says from what, so a decision can
+  // be agreed or disagreed with without reading the source.
+  function renderWhy(vm) {
+    const d = vm.decision || {};
+    if (fnum(d.y) == null) {
+      return `<div class="why"><div class="wrow"><span class="wv">No decision detail yet — it appears on the next tick.</span></div></div>`;
+    }
+    const row = (k, v, mark = "", cls = "") =>
+      `<div class="wrow"><span class="wk">${k}</span><span class="wv">${v}</span>${
+        mark ? `<span class="wm ${cls}">${mark}</span>` : ""}</div>`;
+
+    // Saturation and freezing explain most surprising behaviour, so they lead.
+    const del = Array.isArray(d.deliverable) ? d.deliverable : [null, null];
+    const flags = [];
+    if (d.saturated) {
+      const cold = fnum(d.u_raw) != null && fnum(del[0]) != null && d.u_raw < del[0];
+      flags.push([C.amber, "saturated",
+        `asked ${f2(d.u_raw)}, the unit stops at ${f2(cold ? del[0] : del[1])} — `
+        + `${cold ? "no colder setpoint exists" : "no warmer setpoint exists"}`]);
+    }
+    if (d.frozen) {
+      flags.push([C.grey, "frozen",
+        "integration paused — the guard has the room, or the AC is off"]);
+    }
+    const flagHtml = flags.length
+      ? `<div class="wflags">${flags.map(([c, k, why]) =>
+        `<span class="wflag" style="--c:${c}">${k} <span class="wfx">${esc(why)}</span></span>`).join("")}</div>`
+      : "";
+
+    const rows = [];
+    // 1. the room: where it is, where the dead-time model says it settles.
+    rows.push(row("room", `${f2(d.y)} now → settles ${f2(d.settled)} · ${sg3(d.slope)} °C/min`));
+
+    // 2. the zone being held, and the error the loop actually sees. The zone's
+    //    centre is not the scheduled target: it sits mid-band, because an
+    //    asymmetric band makes the target hug its tight edge, and drops again when
+    //    no fan can run. Two causes, so name whichever is actually in play.
+    const offset = fnum(d.target) != null && vm.target != null ? d.target - vm.target : 0;
+    const mid = (vm.bandHigh - vm.bandLow) / 2 || 0;
+    const why = [];
+    if (Math.abs(mid) > 0.005) why.push(`${sg2(mid)} mid-band`);
+    if (Math.abs(offset - mid) > 0.005) why.push(`${sg2(offset - mid)} no fan`);
+    rows.push(row("zone", `${f2(d.zone_lo)} – ${f2(d.zone_hi)}`
+      + (why.length ? ` (${why.join(", ")})` : ""), `band ${f1(d.lo)}–${f1(d.hi)}`));
+    // Inside the zone the loop is deliberately doing nothing, which is the state a
+    // reader is most likely to misread as broken. Say it, rather than showing a
+    // bare 0 and leaving the conclusion to them.
+    const err = fnum(d.error);
+    const inZone = d.in_zone ?? (err === 0);
+    rows.push(inZone
+      ? row("error", "0 — settles inside the zone", "✓ nothing to correct", "ok")
+      : row("error", `${sg2(d.error)} to the nearest zone edge`,
+        err == null ? "" : err > 0 ? "too cold" : "too warm",
+        err == null ? "" : err > 0 ? "cool" : "warn"));
+
+    rows.push(`<div class="wsep"></div>`);
+
+    // 3. feedforward: the setpoint this weather calls for, before any error.
+    rows.push(row("outdoor", fnum(d.outdoor) != null
+      ? `${f1(d.outdoor)}° outside → ff ${f2(d.u_ff)}`
+      : `no reading → ff ${f2(d.u_ff)} held`));
+
+    // 4. feedback: the residual the feedforward missed, and the memory of it.
+    rows.push(row("feedback", `fb ${sg2(d.u_fb)} · ∫ ${sg2(d.integral)} °C`,
+      d.frozen ? "held" : "", d.frozen ? "warn" : ""));
+
+    // 5. the sum, and what survives the clamp.
+    rows.push(row("demand", `ff ${f2(d.u_ff)} ${sg2(d.u_fb)} = ${f2(d.u_raw)} raw`));
+    rows.push(row("deliver", `clamp ${f1(del[0])} – ${f1(del[1])} → u ${f2(d.u)}`,
+      d.saturated ? "✗ short" : "✓ fits", d.saturated ? "warn" : "ok"));
+
+    // 6. quantisation: one integer setpoint, one blower level, and the fraction
+    //    neither can express — which is exactly what the fan is for.
+    const spNote = fnum(d.sp_observed) != null && d.sp_observed !== d.sp
+      ? ` (unit at ${d.sp_observed})` : "";
+    const blNote = vm.acBlower ? ` ${esc(vm.acBlower)}` : "";
+    rows.push(row("output", `setpoint ${d.sp ?? "–"}${spNote} · blower ${d.blower ?? "–"}${blNote}`
+      + ` · fan takes ${f2(d.trim)}°`));
+
+    // 7. compressor pacing — the one thing that can hold a correct setpoint back.
+    const left = fnum(d.sp_dwell_left);
+    if (d.sp_blocked_by_dwell) {
+      rows.push(row("pacing", `${f1(left)} min to the next setpoint step`, "✗ held", "warn"));
+    } else if (left != null && left > 0) {
+      rows.push(row("pacing", `${f1(left)} min of compressor dwell left`));
+    } else {
+      rows.push(row("pacing", "free to step", "✓", "ok"));
+    }
+
+    if (d.overridden) rows.push(row("guard", `overrode <code>${esc(d.overridden)}</code>`, "✗", "warn"));
+    if (fnum(d.gain) != null) {
+      rows.push(row("model", `K ${f2(d.gain)} · L ${f1(d.dead_time)} · τ ${f1(d.tau)}`
+        + ` · Kc ${f2(d.kc)} · Ti ${f1(d.ti)} · blower ${f2(d.blower_gain)}`));
+    }
+    const arm = vm.branch ? `<div class="wid">arm <code>${esc(vm.branch)}</code></div>` : "";
+    return `<div class="why">${flagHtml}${rows.join("")}${arm}</div>`;
+  }
+
+  // -- tuning: strategy segmented + steppers -----------------------------------
+  function renderTune(vm) {
+    const seg = STRATEGIES.map((s) =>
+      `<button class="segbtn ${s === vm.strategy ? "sel" : ""}" data-action="strategy"
+         data-val="${esc(s)}">${esc(s)}</button>`).join("");
+
+    // `signed` renders an offset below target as a negative value with the buttons
+    // matching temperature direction: "+" warms the floor (toward target → smaller
+    // magnitude), "–" cools it (further below → larger).
+    const stepper = (k) => {
+      // A cap of 0 % is not a quantity, it is a state: the actuator cannot run.
+      const off = k.value === 0 && k.unit === "%";
+      const disp = k.value == null ? "–" : off ? "off"
+        : (k.signed ? `−${Math.abs(k.value).toFixed(2)}` : k.value) + k.unit;
+      const lDir = k.signed ? 1 : -1;   // left "–"
+      const rDir = k.signed ? -1 : 1;   // right "+"
+      return `<div class="stepper">
+          <span class="sk">${esc(k.label)}</span>
+          <button class="sb" data-action="num" data-id="${esc(k.id)}" data-dir="${lDir}">–</button>
+          <span class="sv">${esc(disp)}</span>
+          <button class="sb" data-action="num" data-id="${esc(k.id)}" data-dir="${rDir}">+</button>
+        </div>`;
+    };
+
+    const fanRow = vm.fanAssist ? `
+      <div class="ctl">
+        <span class="sk">fan assist</span>
+        <button class="toggle sm ${vm.fanAssist.on ? "on" : ""}" data-action="fan_assist" role="switch"
+                aria-checked="${vm.fanAssist.on}"
+                title="${vm.fanAssist.on ? "Fan enabled" : "Fan disabled"}"><span class="knob"></span></button>
+      </div>` : "";
+
+    // Only the everyday knobs live on the card; the hard safety limits stay on the
+    // device page.
+    return `
+      <div class="seg">${seg}</div>
+      ${fanRow}
+      <div class="steppers">${vm.knobs.map(stepper).join("")}</div>`;
+  }
+
+  // -- power strip: what the meter did, under what was commanded ---------------
+  // Evidence for a human, never an input. Nothing in the loop reads power; the
+  // strip exists so a command can be checked against the meter's answer.
+  function renderPower(vm) {
+    const h = vm.powerHist;
+    if (!h || !h.pts.length) return "";
+    const W = 320, H = 78, padL = 26, padR = 8, padT = 20, padB = 12;
+    const iw = W - padL - padR, ih = H - padT - padB;
+    const span = Math.max(1, h.t1 - h.t0);
+    const X = (ms) => padL + clamp((ms - h.t0) / span, 0, 1) * iw;
+    const top = Math.max(500, h.max * 1.12);
+    const Y = (w) => padT + (1 - clamp(w, 0, top) / top) * ih;
+
+    let line = "", area = `M${X(h.pts[0].ms).toFixed(1)} ${padT + ih} `;
+    h.pts.forEach((q, i) => {
+      const x = X(q.ms).toFixed(1), y = Y(q.w).toFixed(1);
+      line += (i ? "L" : "M") + x + " " + y + " ";
+      area += "L" + x + " " + y + " ";
+    });
+    area += `L${X(h.pts[h.pts.length - 1].ms).toFixed(1)} ${padT + ih} Z`;
+
+    // Each setpoint change gets a tick where it landed, labelled with the value it
+    // moved to. Labels alternate between two rows ABOVE the plot rather than
+    // competing for one: a tick without its value says a change happened but not
+    // what to, which is the half of the information worth having. Only a genuine
+    // collision within the same row is dropped.
+    const rowY = [padT - 12, padT - 3];
+    const lastAt = [-99, -99];
+    const ticks = h.sp.map((s) => {
+      const x = X(s.ms);
+      let lab = "";
+      const r = lastAt[0] <= lastAt[1] ? 0 : 1;
+      if (x - lastAt[r] > 16) {
+        lastAt[r] = x;
+        lab = `<text x="${(x + 2).toFixed(1)}" y="${rowY[r]}" class="axl sp">${esc(s.v)}</text>`;
+      }
+      return `<line x1="${x.toFixed(1)}" y1="${padT}" x2="${x.toFixed(1)}"
+        y2="${padT + ih}" class="sptick"/>${lab}`;
+    }).join("");
+
+    // Saturation is only known for the live tick — there is no history of it — so
+    // it is marked at the right-hand edge and claimed for nothing earlier.
+    const sat = vm.decision && vm.decision.saturated;
+    const satMark = sat ? `<rect x="${(padL + iw - 5).toFixed(1)}" y="${padT}" width="5"
+      height="${ih}" fill="${C.amber}" opacity="0.3"/>` : "";
+
+    const hrs = Math.max(1, Math.round(span / 3600000));
+    return `<svg viewBox="0 0 ${W} ${H}" class="pwrsvg">
+        <line x1="${padL}" y1="${padT}" x2="${W - padR}" y2="${padT}" class="grid faint"/>
+        <line x1="${padL}" y1="${padT + ih}" x2="${W - padR}" y2="${padT + ih}" class="grid"/>
+        <text x="${padL - 5}" y="${padT + 3}" class="axl" text-anchor="end">${(top / 1000).toFixed(1)}</text>
+        <text x="${padL - 5}" y="${padT + ih}" class="axl" text-anchor="end">0</text>
+        <path d="${area}" fill="${C.grey}" fill-opacity="0.2"/>
+        <path d="${line.trim()}" fill="none" stroke="${C.grey}" stroke-width="1.2"
+          stroke-linejoin="round"/>
+        ${ticks}${satMark}
+        <text x="${padL}" y="${H - 2}" class="axl">−${hrs}h</text>
+        <text x="${W - padR}" y="${H - 2}" class="axl" text-anchor="end">now</text>
+      </svg>
+      <div class="hint">Meter, last ${hrs} h · kW
+        <span class="lg"><i class="sw" style="background:${C.cool};width:2px;height:9px"></i>setpoint change</span>
+        ${sat ? `<span class="lg"><i class="sw" style="background:${C.amber};width:5px;height:9px"></i>saturated now</span>` : ""}</div>`;
+  }
+
+  // ===========================================================================
+  // Schedule editor — the only stateful component
+  // ===========================================================================
+  // Owns the draft, the selection and its own listeners. A full re-render happens
+  // only when the data behind the chart changes; every interaction (tap, drag,
+  // hover, stepper) patches the attributes that moved, so the node under the
+  // pointer capture survives the whole gesture.
+  class ScheduleEditor {
+    constructor(root, { onSave, onDirty }) {
+      this.root = root;
+      this.onSave = onSave;
+      this.onDirty = onDirty;
+      this.draft = null;        // local edits (null = follow the entity)
+      this.sel = null;          // selected slot (tap-to-select + stepper editing)
+      this.dragging = false;
+      this.active = null;       // {i, t} being dragged/hovered — drives the badge
+      this.hoverI = null;
+      this.lastI = null;        // last painted slot, for fast-drag interpolation
+      this.pressX = 0; this.pressY = 0;
+      this.vm = null;
+      this.sig = null;
+      this.el = null;
+      root.addEventListener("click", (e) => this._onClick(e));
+    }
+
+    get data() { return this.draft || (this.vm ? this.vm.schedule : new Array(SLOTS).fill(26)); }
+
+    update(vm) {
+      // Schedules are per-strategy: when the strategy changes, drop any draft so
+      // the new strategy's curve renders instead of the old one's edits.
+      if (this.vm && vm.strategy !== this.vm.strategy) {
+        this.draft = null;
+        this.dragging = false;
+        this.active = null;
+        this.onDirty(false);
+      }
+      this.vm = vm;
+      if (this.dragging) return;              // never clobber a live gesture
+      if (this.sig !== null && this.sig === this._sig()) return;
+      this._renderFull();
+    }
+
+    revert() {
+      this.draft = null;
+      this.dragging = false;
+      this.active = null;
+      this.onDirty(false);
+      if (this.vm) this._renderFull();
+    }
+
+    save() {
+      if (!this.draft) return;
+      const out = this.draft.map((v) => +(+v).toFixed(1));
+      this.draft = null;
+      this.onDirty(false);
+      this.onSave(out);
+      this._renderFull();
+    }
+
+    // -- geometry -----------------------------------------------------------
+    _geo() {
+      const W = 320, H = 160, padL = 26, padR = 8, padT = 10, padB = 20;
+      const iw = W - padL - padR, ih = H - padT - padB;
+      const tmin = this.vm.tmin, tmax = this.vm.tmax;
+      return {
+        W, H, padL, padR, padT, padB, iw, ih, tmin, tmax,
+        X: (i) => padL + (i / (SLOTS - 1)) * iw,
+        Y: (t) => padT + ((tmax - clamp(t, tmin, tmax)) / (tmax - tmin)) * ih,
+        XA: (hf) => padL + (clamp(hf, 0, 24) / 24) * iw,
+      };
+    }
+
+    // Everything the chart is drawn FROM. A patch keeps the DOM in step with it,
+    // so comparing it is what tells a real data change from an echo of our own.
+    _sig() {
+      const v = this.vm;
+      return [this.data.join(","), this.sel, this.active ? `${this.active.i}:${this.active.t}` : "",
+        v.comfort, v.histStamp, v.tmin, v.tmax].join("|");
+    }
+
+    _paths(g) {
+      const d = this.data;
+      let line = "", area = `M${g.X(0)} ${g.padT + g.ih} `, dots = [];
+      d.forEach((t, i) => {
+        const x = g.X(i).toFixed(1), y = g.Y(t).toFixed(1);
+        line += (i ? "L" : "M") + x + " " + y + " ";
+        area += "L" + x + " " + y + " ";
+        dots.push(y);
+      });
+      area += `L${g.X(SLOTS - 1)} ${g.padT + g.ih} Z`;
+      return { line: line.trim(), area, dots };
+    }
+
+    _badgeAt(i, t, g) {
+      const bx = g.X(i), by = g.Y(t), bw = 70;
+      return {
+        bx, by, bw,
+        tx: clamp(bx, g.padL + bw / 2, g.W - g.padR - bw / 2),
+        ty: clamp(by - 12, g.padT + 15, g.padT + g.ih),
+        label: `${String(Math.floor(i / 2)).padStart(2, "0")}:${i % 2 ? "30" : "00"} · ${(+t).toFixed(1)}°`,
+      };
+    }
+
+    // -- full render --------------------------------------------------------
+    _renderFull() {
+      const g = this._geo();
+      const now = new Date();
+      const nowFrac = (now.getHours() * 60 + now.getMinutes()) / 1440;
+      const nowX = g.padL + nowFrac * g.iw;
+      const nowHf = nowFrac * 24;
+      if (this.sel == null) {   // open on the current time
+        this.sel = clamp(Math.floor((now.getHours() * 60 + now.getMinutes()) / 30), 0, SLOTS - 1);
+      }
+
+      const p = this._paths(g);
+      const grid = [0, 6, 12, 18, 24].map((h) => {
+        const gx = g.padL + (h / 24) * g.iw;
+        return `<line x1="${gx}" y1="${g.padT}" x2="${gx}" y2="${g.padT + g.ih}" class="grid"/>
+                <text x="${gx}" y="${g.H - 5}" class="axl" text-anchor="middle">${h}</text>`;
+      }).join("");
+
+      // Y ticks that fit the (configurable) range: whole degrees inside it, or
+      // min/mid/max if the range is narrower than ~2°.
+      const ticks = [];
+      for (let t = Math.ceil(g.tmin); t <= Math.floor(g.tmax); t++) ticks.push(t);
+      if (ticks.length < 2) {
+        ticks.length = 0;
+        ticks.push(g.tmin, Math.round((g.tmin + g.tmax) * 5) / 10, g.tmax);
+      }
+      const yticks = ticks.map((t) =>
+        `<text x="${g.padL - 5}" y="${(g.Y(t) + 3).toFixed(1)}" class="axl" text-anchor="end"
+           >${Number.isInteger(t) ? t : t.toFixed(1)}</text>
+         <line x1="${g.padL}" y1="${g.Y(t).toFixed(1)}" x2="${g.W - g.padR}" y2="${g.Y(t).toFixed(1)}"
+           class="grid faint"/>`).join("");
+
+      const dots = p.dots.map((y, i) =>
+        `<circle cx="${g.X(i).toFixed(1)}" cy="${y}" r="2" class="dot"/>`).join("");
+
+      const nowDot = this.vm.comfort != null
+        ? `<circle cx="${nowX.toFixed(1)}" cy="${g.Y(this.vm.comfort).toFixed(1)}" r="4"
+             fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>` : "";
+
+      // Actual comfort on the same axes as the target, mapped by hour-of-day.
+      // Today = SOLID (00:00 → now). Yesterday = a THIN line drawn only over the
+      // part of the day that has not happened yet, so the two read as one
+      // continuous rolling trace with no overlap.
+      const act = this.vm.actual || { today: [], yesterday: [] };
+      const trace = (pts) => {
+        if (!pts || !pts.length) return "";
+        let d = "";
+        pts.forEach((q, i) => { d += (i ? "L" : "M") + g.XA(q.hf).toFixed(1) + " " + g.Y(q.t).toFixed(1) + " "; });
+        return d.trim();
+      };
+      const yPath = trace((act.yesterday || []).filter((q) => q.hf >= nowHf));
+      const tPath = trace(act.today);
+      const actual =
+        (yPath ? `<path d="${yPath}" fill="none" stroke="${C.warm}" stroke-width="1"
+           stroke-opacity="0.5" stroke-linejoin="round" stroke-linecap="round"/>` : "")
+        + (tPath ? `<path d="${tPath}" fill="none" stroke="${C.warm}" stroke-width="1.5"
+           stroke-opacity="0.9" stroke-linejoin="round" stroke-linecap="round"/>` : "");
+
+      // Outdoor temperature, today so far. It answers "why did the setpoint go
+      // there", so it belongs on this chart — but it runs 25–33° against a 25–27°
+      // window and would leave the frame, so it gets its OWN vertical scale,
+      // stretched over the plot and named with its range in the legend. No shared
+      // axis means no reading a crossing as if the two lines met.
+      const od = this.vm.outdoorTrace || [];
+      let odPath = "", odRange = "";
+      if (od.length) {
+        let olo = Math.min(...od.map((q) => q.t)), ohi = Math.max(...od.map((q) => q.t));
+        const pad = Math.max(0.5, (ohi - olo) * 0.12);
+        olo -= pad; ohi += pad;
+        const OY = (t) => g.padT + ((ohi - clamp(t, olo, ohi)) / (ohi - olo)) * g.ih;
+        od.forEach((q, i) => {
+          odPath += (i ? "L" : "M") + g.XA(q.hf).toFixed(1) + " " + OY(q.t).toFixed(1) + " ";
+        });
+        odPath = `<path d="${odPath.trim()}" fill="none" stroke="${C.out}" stroke-width="1.2"
+          stroke-dasharray="4 3" stroke-opacity="0.75" stroke-linejoin="round"/>`;
+        odRange = `${Math.round(olo)}–${Math.round(ohi)}°`;
+      }
+
+      this.root.innerHTML = `
+        <svg id="cz-svg" viewBox="0 0 ${g.W} ${g.H}" class="schedsvg">
+          <defs>
+            <linearGradient id="czgrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="${C.warm}" stop-opacity="0.28"/>
+              <stop offset="100%" stop-color="${C.cool}" stop-opacity="0.10"/>
+            </linearGradient>
+          </defs>
+          ${yticks}${grid}
+          <path id="cz-area" d="${p.area}" fill="url(#czgrad)"/>
+          ${odPath}
+          ${actual}
+          <path id="cz-line" d="${p.line}" fill="none" stroke="var(--primary-color)"
+            stroke-width="2" stroke-linejoin="round"/>
+          <g id="cz-dots">${dots}</g>
+          <line x1="${nowX.toFixed(1)}" y1="${g.padT}" x2="${nowX.toFixed(1)}"
+            y2="${g.padT + g.ih}" class="now"/>
+          ${nowDot}
+          <circle id="cz-sel" r="6" fill="var(--card-background-color)"
+            stroke="var(--primary-color)" stroke-width="2.5"/>
+          <g id="cz-badge" text-anchor="middle" style="pointer-events:none">
+            <rect width="70" height="16" rx="4" fill="var(--primary-color)"/>
+            <text font-size="10.5" font-weight="700" fill="var(--text-primary-color, #fff)"></text>
+            <circle r="4" fill="var(--primary-color)" stroke="var(--card-background-color)" stroke-width="1.5"/>
+          </g>
+        </svg>
+        <div class="sched-edit">
+          <div class="se-grp">
+            <button class="se-btn" data-action="sel-move" data-d="-1" aria-label="earlier">‹</button>
+            <span class="se-lab" id="cz-selt"></span>
+            <button class="se-btn" data-action="sel-move" data-d="1" aria-label="later">›</button>
+          </div>
+          <div class="se-grp">
+            <button class="se-btn" data-action="sel-adj" data-d="-1" aria-label="cooler">−</button>
+            <span class="se-lab val" id="cz-selv"></span>
+            <button class="se-btn" data-action="sel-adj" data-d="1" aria-label="warmer">+</button>
+          </div>
+        </div>
+        <div class="hint">Tap a point to select · drag to sketch · nudge with the buttons
+          <span class="lg"><i class="sw" style="background:var(--primary-color)"></i>target</span>
+          <span class="lg"><i class="sw" style="background:${C.warm}"></i>actual today</span>
+          <span class="lg"><i class="sw" style="background:${C.warm};opacity:.5;height:1px"></i>yesterday (ahead)</span>
+          ${odRange ? `<span class="lg"><i class="sw" style="background:${C.out}"></i
+            >outdoor ${odRange} (own scale)</span>` : ""}</div>`;
+
+      const q = (id) => this.root.querySelector(id);
+      const badge = q("#cz-badge");
+      this.el = {
+        svg: q("#cz-svg"), line: q("#cz-line"), area: q("#cz-area"),
+        dots: Array.from(q("#cz-dots").children),
+        sel: q("#cz-sel"),
+        badge, bRect: badge.querySelector("rect"), bText: badge.querySelector("text"),
+        bDot: badge.querySelector("circle"),
+        selT: q("#cz-selt"), selV: q("#cz-selv"),
+      };
+      this._bind(this.el.svg);
+      this._patch();
+    }
+
+    // -- patch: the only thing an interaction touches -----------------------
+    _patch() {
+      if (!this.el) return;
+      const g = this._geo();
+      const data = this.data;
+      const p = this._paths(g);
+      this.el.line.setAttribute("d", p.line);
+      this.el.area.setAttribute("d", p.area);
+      for (let i = 0; i < this.el.dots.length; i++) this.el.dots[i].setAttribute("cy", p.dots[i]);
+
+      if (this.sel != null && data[this.sel] != null) {
+        this.el.sel.setAttribute("cx", g.X(this.sel).toFixed(1));
+        this.el.sel.setAttribute("cy", g.Y(data[this.sel]).toFixed(1));
+        this.el.sel.removeAttribute("display");
+      } else {
+        this.el.sel.setAttribute("display", "none");
+      }
+
+      // Badge "HH:MM · 26.4°" — the dragged/hovered point if there is one, else
+      // the selected point, so the exact target is always readable.
+      const bi = this.active ? this.active.i : this.sel;
+      const bt = this.active ? this.active.t : (this.sel != null ? data[this.sel] : null);
+      if (bi != null && bt != null) {
+        const b = this._badgeAt(bi, bt, g);
+        this.el.bRect.setAttribute("x", (b.tx - b.bw / 2).toFixed(1));
+        this.el.bRect.setAttribute("y", (b.ty - 13).toFixed(1));
+        this.el.bText.setAttribute("x", b.tx.toFixed(1));
+        this.el.bText.setAttribute("y", (b.ty - 1).toFixed(1));
+        this.el.bText.textContent = b.label;
+        this.el.bDot.setAttribute("cx", b.bx.toFixed(1));
+        this.el.bDot.setAttribute("cy", b.by.toFixed(1));
+        this.el.badge.removeAttribute("display");
+      } else {
+        this.el.badge.setAttribute("display", "none");
+      }
+
+      const s = this.sel ?? 0;
+      this.el.selT.textContent = `${String(Math.floor(s / 2)).padStart(2, "0")}:${s % 2 ? "30" : "00"}`;
+      this.el.selV.textContent = `${(+(data[s] ?? 26)).toFixed(1)}°`;
+      this.sig = this._sig();
+    }
+
+    // -- pointer ------------------------------------------------------------
+    _bind(svg) {
+      const MOVE_THRESH = 5;   // svg units of movement before a press becomes a sketch
+      const toSvg = (ev) => {
+        const r = svg.getBoundingClientRect();
+        const g = this._geo();
+        return { x: ((ev.clientX - r.left) / r.width) * g.W, y: ((ev.clientY - r.top) / r.height) * g.H, g };
+      };
+      const toVal = (ev) => {
+        const { x, y, g } = toSvg(ev);
+        return {
+          i: clamp(Math.round(((x - g.padL) / g.iw) * (SLOTS - 1)), 0, SLOTS - 1),
+          t: clamp(snap(g.tmax - ((y - g.padT) / g.ih) * (g.tmax - g.tmin), 0.1), g.tmin, g.tmax),
+        };
+      };
+
+      svg.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        const { x, y } = toSvg(ev);
+        this.sel = toVal(ev).i;        // TAP = select (non-destructive)
+        this.dragging = false;
+        this.lastI = null;
+        this.hoverI = null;
+        this.pressX = x; this.pressY = y;
+        // The node keeps the capture for the whole gesture, which is why nothing
+        // below here re-renders the svg. A capture can still be refused (a
+        // detached node, a synthetic event) and that must not cost the tap.
+        try { svg.setPointerCapture(ev.pointerId); } catch (err) { /* tap still works */ }
+        this._patch();                 // show the selection without replacing the node
+      });
+
+      svg.addEventListener("pointermove", (ev) => {
+        if (ev.buttons) {              // pressed → sketch once it moves past threshold
+          if (!this.dragging) {
+            const { x, y } = toSvg(ev);
+            if (Math.abs(x - this.pressX) < MOVE_THRESH && Math.abs(y - this.pressY) < MOVE_THRESH) return;
+            this.dragging = true;
+          }
+          const { i, t } = toVal(ev);
+          const d = this.draft || this.data.slice();
+          if (this.lastI != null && Math.abs(i - this.lastI) > 1) {
+            // interpolate across a fast drag, so no slot is skipped
+            const a = Math.min(i, this.lastI), b = Math.max(i, this.lastI);
+            const va = d[this.lastI];
+            for (let k = a; k <= b; k++) d[k] = va + (t - va) * ((k - this.lastI) / (i - this.lastI));
+          } else {
+            d[i] = t;
+          }
+          this.lastI = i;
+          this.draft = d;
+          this.sel = i;                // selection follows the sketch
+          this.active = { i, t };
+          this.onDirty(true);
+          this._patch();
+          return;
+        }
+        // Hover (mouse only, not pressed): read that point's value, destructively
+        // of nothing.
+        const { i } = toVal(ev);
+        if (i === this.hoverI) return;
+        this.hoverI = i;
+        this.active = { i, t: this.data[i] };
+        this._patch();
+      });
+
+      const end = (ev) => {
+        if (ev && ev.pointerId != null && svg.hasPointerCapture(ev.pointerId)) {
+          svg.releasePointerCapture(ev.pointerId);
+        }
+        this.dragging = false;
+        this.lastI = null;
+        this.active = null;
+        this.hoverI = null;
+        this._patch();                 // keep the selection; clear the transient badge
+      };
+      svg.addEventListener("pointerup", end);
+      svg.addEventListener("pointercancel", end);
+      svg.addEventListener("pointerleave", () => {
+        if (this.dragging || this.active == null) return;
+        this.hoverI = null;
+        this.active = null;
+        this._patch();
+      });
+    }
+
+    _onClick(e) {
+      const el = e.target.closest("[data-action]");
+      if (!el || !this.vm) return;
+      if (el.dataset.action === "sel-move") {
+        this.sel = clamp((this.sel ?? 0) + +el.dataset.d, 0, SLOTS - 1);
+        this._patch();
+      } else if (el.dataset.action === "sel-adj") {
+        if (this.sel == null) return;
+        const d = this.draft || this.data.slice();
+        // Edits use the full room range, not the chart window: a point outside the
+        // window has to stay reachable, or it can never be brought back inside.
+        d[this.sel] = clamp(snap((+d[this.sel] || 26) + +el.dataset.d * 0.1, 0.1), EDIT_MIN, EDIT_MAX);
+        this.draft = d;
+        this.onDirty(true);
+        this._patch();
+      }
+    }
+  }
+
+  // ===========================================================================
+  // The card
+  // ===========================================================================
   class ComfortZoneCard extends HTMLElement {
     setConfig(config) {
       if (!config || !config.zone) {
@@ -88,16 +1016,17 @@
       if (tmin == null) tmin = DEF_TMIN;
       if (tmax == null) tmax = DEF_TMAX;
       if (!(tmax - tmin >= 1)) { tmin = DEF_TMIN; tmax = DEF_TMAX; }  // sane guard
-      this._tmin = clamp(tmin, 10, 34);
-      this._tmax = clamp(tmax, this._tmin + 1, 40);
-      this._draft = null;       // local schedule edits (null = follow the entity)
-      this._dragging = false;
-      this._activeEdit = null;  // {i, t} of the point being dragged/hovered (value badge)
-      this._hoverI = null;      // last hovered slot index (mouse, non-destructive readout)
-      this._sel = null;         // selected slot index (tap-to-select + stepper editing)
-      this._lastSig = null;
-      this._actual = null;      // cached actual-comfort trace for today [{hf, t}]
-      this._actualFetchedAt = 0;
+      this._tmin = clamp(tmin, EDIT_MIN, EDIT_MAX - 1);
+      this._tmax = clamp(tmax, this._tmin + 1, EDIT_MAX);
+      this._why = false;             // the why panel, and nothing else
+      this._entCache = {};
+      this._sig = {};
+      this._actual = null;           // cached actual-comfort trace [{hf, t}]
+      this._outdoorTrace = null;     // today's outdoor temperature [{hf, t}]
+      this._powerHist = null;        // {pts, sp, max, t0, t1} for the power strip
+      this._histStamp = 0;
+      this._histAt = 0;
+      this._histKey = "";
       if (!this.shadowRoot) this.attachShadow({ mode: "open" });
       this._buildShell();
     }
@@ -107,66 +1036,16 @@
       this._update();
     }
 
-    getCardSize() { return 13; }
-
-    // -- entity resolution ---------------------------------------------------
-    _resolve() {
-      const hass = this._hass;
-      const statusId = this._config.zone;
-      const out = { status: statusId };
-      const slugFull = statusId.replace(/^sensor\./, "").replace(/_status$/, ""); // master_bedroom
-
-      // Prefer the device registry so we survive HA's entity-id auto-naming.
-      const reg = hass.entities || {};
-      const dev = reg[statusId] ? reg[statusId].device_id : null;
-      const sib = dev ? Object.keys(reg).filter((id) => reg[id].device_id === dev) : [];
-
-      const nameOf = (id) => (hass.states[id]?.attributes?.friendly_name || "").toLowerCase();
-      for (const id of sib) {
-        const domain = id.split(".")[0];
-        const fn = nameOf(id);
-        if (domain === "switch") {
-          if (fn.includes("fan assist")) out.fanAssist = id;
-          else out.enable = id;
-        } else if (domain === "select") out.strategy = id;
-        else if (domain === "sensor") {
-          if (id === statusId) continue;
-          if (fn.includes("comfort")) out.comfort = id;
-          else if (fn.includes("predict")) out.predicted = id;
-          else if (fn.includes("rate") || fn.includes("slope") || fn.includes("变化")) out.slope = id;
-          else if (fn.includes("target")) out.target = id;
-        } else if (domain === "number") {
-          if (fn.includes("band") && fn.includes("low")) out.bandLow = id;
-          else if (fn.includes("band") && fn.includes("off")) out.bandHighNoFan = id;
-          else if (fn.includes("band") && fn.includes("high")) out.bandHigh = id;
-          else if (fn.includes("hard min")) out.hardMin = id;
-          else if (fn.includes("hard max")) out.hardMax = id;
-          else if (fn.includes("fan max") && fn.includes("night")) out.fanMaxNight = id;
-          else if (fn.includes("fan max")) out.fanMaxDay = id;
-        }
-      }
-      // Fallbacks by id substitution (registry path above is preferred).
-      out.comfort ||= `sensor.${slugFull}_comfort_temperature`;
-      out.target ||= `sensor.${slugFull}_target`;
-      out.predicted ||= `sensor.${slugFull}_predicted_settled`;
-      out.slope ||= `sensor.${slugFull}_rate_of_change`;
-      out.enable ||= `switch.${slugFull}_enabled`;
-      out.fanAssist ||= `switch.${slugFull}_fan_assist`;
-      out.strategy ||= `select.${slugFull}_strategy`;
-      out.bandLow ||= `number.${slugFull}_band_low`;
-      out.bandHigh ||= `number.${slugFull}_band_high`;
-      out.bandHighNoFan ||= `number.${slugFull}_band_high_no_fan`;
-      out.fanMaxDay ||= `number.${slugFull}_fan_max_day`;
-
-      // Zone name for the set_schedule service = device/friendly name minus " Status".
-      const fn = hass.states[statusId]?.attributes?.friendly_name || slugFull;
-      out.zoneName = fn.replace(/\s*status$/i, "").trim() || slugFull;
-      return out;
+    // Public so a host (the preview page, a dashboard action) can open the panel
+    // without reaching into private state.
+    get showWhy() { return this._why; }
+    set showWhy(v) {
+      this._why = !!v;
+      this._update();
     }
 
-    _st(id) { return id ? this._hass.states[id] : undefined; }
+    getCardSize() { return 10; }
 
-    // -- shell ---------------------------------------------------------------
     _buildShell() {
       this.shadowRoot.innerHTML = `
         <style>${STYLE}</style>
@@ -182,18 +1061,26 @@
                 </span>
               </div>
               <div id="sched"></div>
+              <div id="pwr" class="pwr"></div>
             </section>
             <section class="sec">
               <div class="eyebrow"><span>Tuning</span></div>
               <div id="tune"></div>
             </section>
-            <section class="sec">
-              <div class="eyebrow"><span>Recent decisions</span></div>
-              <div id="hist"></div>
-            </section>
           </div>
         </ha-card>`;
 
+      this._editor = new ScheduleEditor(this.shadowRoot.getElementById("sched"), {
+        onSave: (schedule) => this._hass.callService("comfort_zone", "set_schedule", {
+          name: this._vm.zoneName, schedule,
+        }),
+        onDirty: (dirty) => {
+          const save = this.shadowRoot.getElementById("btn-save");
+          const rev = this.shadowRoot.getElementById("btn-revert");
+          if (save) save.disabled = !dirty;
+          if (rev) rev.disabled = !dirty;
+        },
+      });
       // event delegation — survives section re-renders
       this.shadowRoot.addEventListener("click", (e) => this._onClick(e));
     }
@@ -201,599 +1088,185 @@
     // -- update loop ---------------------------------------------------------
     _update() {
       if (!this._hass || !this.shadowRoot) return;
-      const status = this._st(this._config.zone);
+      const vm = viewModel(this._hass, this._config, this._entCache);
       const miss = this.shadowRoot.getElementById("cz-missing");
       const body = this.shadowRoot.getElementById("cz-body");
-      if (!status || status.state === "unavailable") {
+      if (!vm.ok) {
         miss.hidden = false;
         body.hidden = true;
-        miss.textContent = `Waiting for ${this._config.zone}…`;
+        miss.textContent = vm.missing;
         return;
       }
       miss.hidden = true;
       body.hidden = false;
+      this._vm = vm;
 
-      this._ent = this._resolve();
-
-      // Schedules are per-strategy: when the strategy changes, drop any draft so
-      // we render the new strategy's curve instead of the old one's edits.
-      const strat = status.attributes.strategy;
-      if (this._lastStrategy !== undefined && strat !== this._lastStrategy) {
-        this._draft = null;
-        this._dragging = false;
-        this._markDirty(false);
-      }
-      this._lastStrategy = strat;
-
-      this._renderHeader(status);
-      this._renderTune(status);
-      this._renderHistory(status);
-      if (!this._dragging) this._renderSchedule(status); // don't clobber a live drag
-      this._maybeFetchActual();
+      // One innerHTML write per island, and only when that island's markup would
+      // differ: an unrelated HA state change no longer rebuilds the DOM under the
+      // pointer, so hover, scroll and focus survive it.
+      const full = Object.assign({
+        tmin: this._tmin, tmax: this._tmax, histStamp: this._histStamp,
+        actual: this._actual, outdoorTrace: this._outdoorTrace, powerHist: this._powerHist,
+      }, vm);
+      this._write("hd", renderHeader(vm, this._why));
+      this._write("tune", renderTune(vm));
+      this._write("pwr", renderPower(full));
+      this._editor.update(full);
+      this._maybeFetchHistory(vm);
     }
 
-    // -- actual comfort trace (today solid, yesterday dotted) ----------------
-    // Fetch a trailing ~48h of the room's real comfort and bucket it by LOCAL
-    // CALENDAR DAY: today's actual is drawn SOLID (00:00 → now), the previous
-    // day's DOTTED as a full-width reference. Plotted by hour-of-day on the same
-    // axes as the target so the two compare directly while shaping the curve.
-    // As today advances its solid line extends over yesterday's dotted one.
-    // Throttled to ≤ once / 3 min; cached and redrawn from cache otherwise.
-    _maybeFetchActual() {
-      // Prefer the backend's real SOURCE sensor (e.g. 婴儿床 舒适温度) — it has
-      // history from before this integration was installed. Fall back to the
-      // integration's own comfort sensor (compute mode).
-      const em = this._st(this._config.zone)?.attributes?.entities || {};
-      const id = em.comfort || (this._ent && this._ent.comfort);
-      if (!id || !this._hass || !this._hass.callWS) return;
+    _write(id, html) {
+      if (this._sig[id] === html) return;
+      this._sig[id] = html;
+      this.shadowRoot.getElementById(id).innerHTML = html;
+    }
+
+    // -- history: the three traces the card draws from the recorder ------------
+    // Two windows, because they are two different pictures: a 48 h one for the
+    // daily chart (comfort bucketed by calendar day, plus today's outdoor) and a
+    // 6 h one for the power strip. Splitting on the window, not on the payload,
+    // keeps 6 h of a fast-sampling power meter out of the 48 h request. Both are
+    // throttled to ≤ once / 3 min; everything else redraws from cache.
+    _maybeFetchHistory(vm) {
+      if (!this._hass.callWS) return;
       const nowMs = Date.now();
-      const fresh = this._actualId === id && this._actualFetchedAt && nowMs - this._actualFetchedAt < 180000;
-      if (fresh) return;
-      this._actualId = id;
-      this._actualFetchedAt = nowMs; // set first so overlapping updates don't refetch
-      const start = new Date(nowMs - 48 * 3600 * 1000);
-      this._hass.callWS({
+      const key = [vm.historyEntity, vm.weatherEntity, vm.powerEntity, vm.acEntity].join("|");
+      if (this._histKey === key && nowMs - this._histAt < 180000) return;
+      this._histKey = key;
+      this._histAt = nowMs;   // set first so overlapping updates don't refetch
+      const ask = (hours, ids) => this._hass.callWS({
         type: "history/history_during_period",
-        start_time: start.toISOString(),
-        end_time: new Date().toISOString(),
-        entity_ids: [id],
-        minimal_response: true,
-        no_attributes: true,
-      }).then((res) => {
-        const arr = (res && res[id]) || [];
-        const mid = new Date(); mid.setHours(0, 0, 0, 0);
-        const midToday = mid.getTime();
-        const midYest = midToday - 24 * 3600 * 1000;
+        start_time: new Date(nowMs - hours * 3600 * 1000).toISOString(),
+        end_time: new Date(nowMs).toISOString(),
+        entity_ids: ids,
+        // The weather entity keeps its temperature in an ATTRIBUTE, and so does the
+        // climate entity's setpoint, so attributes have to come along. HA repeats
+        // them only when they change, which is what makes one call affordable.
+        no_attributes: false,
+      });
+      // A recorder row carries `a` only when the attributes changed, so a reader of
+      // one attribute has to carry the last value forward itself.
+      const attrs = (arr, key) => {
+        const out = [];
+        let last = null;
+        for (const p of arr || []) {
+          const a = p.a || p.attributes;
+          if (a && a[key] != null) last = fnum(a[key]);
+          const lu = p.lu != null ? p.lu : p.last_updated;
+          if (last == null || lu == null) continue;
+          out.push({ ms: lu * 1000, v: last });
+        }
+        return out.sort((x, y) => x.ms - y.ms);
+      };
+
+      const mid = new Date(); mid.setHours(0, 0, 0, 0);
+      const midToday = mid.getTime();
+      const midYest = midToday - 24 * 3600 * 1000;
+      const hourFrac = (ms) => {
+        const d = new Date(ms);
+        return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+      };
+
+      // Prefer the backend's real SOURCE comfort sensor (e.g. 婴儿床 舒适温度) — it
+      // has history from before this integration was installed.
+      const long = [vm.historyEntity, vm.weatherEntity].filter(Boolean);
+      if (long.length) ask(48, long).then((res) => {
         const today = [], yesterday = [];
-        for (const p of arr) {
+        for (const p of (res && res[vm.historyEntity]) || []) {
           const v = fnum(p.s);
           const lu = p.lu != null ? p.lu : p.last_updated;
           if (v == null || lu == null) continue;
           const ms = lu * 1000;
-          const d = new Date(ms);
-          const pt = { ms, hf: d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600, t: v };
+          const pt = { ms, hf: hourFrac(ms), t: v };
           if (ms >= midToday) today.push(pt);
           else if (ms >= midYest) yesterday.push(pt);
         }
         today.sort((a, b) => a.ms - b.ms);
         yesterday.sort((a, b) => a.ms - b.ms);
         this._actual = { today, yesterday };
-        const status = this._st(this._config.zone);
-        if (status && !this._dragging) this._renderSchedule(status);
-      }).catch(() => { /* no history → just skip the overlay */ });
-    }
+        this._outdoorTrace = attrs(res && res[vm.weatherEntity], "temperature")
+          .filter((q) => q.ms >= midToday).map((q) => ({ hf: hourFrac(q.ms), t: q.v }));
+        this._histStamp++;
+        this._update();
+      }).catch(() => { /* no history → just skip the overlays */ });
 
-    // -- header / live state -------------------------------------------------
-    _renderHeader(status) {
-      const a = status.attributes;
-      const em = a.entities || {};
-      const mode = a.enabled === false ? "disabled" : status.state;
-      const meta = MODES[mode] || { label: mode, color: C.grey };
-      const comfort = fnum(this._st(this._ent.comfort)?.state) ?? a.comfort ?? null;
-      const target = fnum(this._st(this._ent.target)?.state) ?? a.target ?? null;
-      const bandLow = fnum(a.band_low) ?? 0.4;
-      const bandHigh = fnum(a.band_high) ?? bandLow;
-      const onTarget = comfort != null && target != null
-        && comfort >= target - bandLow && comfort <= target + bandHigh;
-      // "idle" already reads "On target"; don't double it up.
-      const pillLabel = mode === "idle" ? meta.label : meta.label + (onTarget ? " · on target" : "");
-
-      const pdelta = fnum(a.power_delta);   // coordinator-derived (per tick, by design)
-      const parrow = pdelta == null || Math.abs(pdelta) < 40 ? "" :
-        (pdelta > 0 ? `<span class="up">▲</span>` : `<span class="dn">▼</span>`);
-      // POWER value read live from the sensor (real-time), not the tick snapshot.
-      const power = em.power ? (fnum(this._st(em.power)?.state) ?? fnum(a.power)) : fnum(a.power);
-      const slope = fnum(a.slope);          // coordinator-derived (5-min window)
-      const feelEnt = em.comfort || em.temp || this._ent.comfort || this._config.zone;
-
-      // chip(): `ent` (optional) makes it open that entity's native HA history.
-      const chip = (label, val, extra = "", ent = null) => {
-        const clickable = ent ? `data-action="more" data-entity="${ent}"` : "";
-        return `<div class="chip ${extra} ${ent ? "clk" : ""}" ${clickable}>
-          <span class="k">${label}</span><span class="v">${val}</span></div>`;
-      };
-
-      // AC state chip — read LIVE from the climate entity (real-time), falling
-      // back to the tick snapshot. Reflects what the AC is actually doing,
-      // distinct from the controller mode (the AC keeps cooling while idle).
-      const acSt = this._st(em.ac);
-      const acOn = acSt ? !["off", "unavailable", "unknown"].includes(acSt.state) : a.ac_on;
-      const acState = acSt ? acSt.state : a.ac_state;
-      const acSetpoint = acSt ? fnum(acSt.attributes.temperature) : a.setpoint;
-      const acBlower = blowerLabel(acSt ? acSt.attributes.fan_mode : a.ac_blower);
-      let acChip;
-      if (acOn) {
-        const st = acState && acState !== "cool" ? acState : "cool";
-        const parts = [st, acSetpoint != null ? `${acSetpoint}°` : "", acBlower || ""].filter(Boolean);
-        acChip = chip("ac", parts.join(" "), "", em.ac);
-      } else {
-        acChip = chip("ac", "off", "soft", em.ac);
-      }
-
-      // Fan chip — LIVE from the fan + speed entities and the fan-assist switch.
-      const fanSt = this._st(em.fan);
-      const fanOnLive = fanSt ? fanSt.state === "on" : a.fan_on;
-      const fanLevelLive = em.fan_speed ? fnum(this._st(em.fan_speed)?.state) : a.fan_level;
-      const fanAssistSt = this._st(this._ent.fanAssist);
-      const fanAssistOn = fanAssistSt ? fanAssistSt.state === "on" : (a.fan_assist_enabled !== false);
-      let fanChip;
-      if (!fanAssistOn) {
-        fanChip = chip("fan", "assist off", "soft", em.fan);
-      } else if (fanOnLive) {
-        fanChip = chip("fan", `${fanLevelLive != null ? fanLevelLive : "on"}`, "", em.fan);
-      } else {
-        fanChip = chip("fan", "off", "soft", em.fan);
-      }
-
-      const enableOn = a.enabled !== false;
-      const chips = [
-        acChip,
-        fanChip,
-        power != null ? chip("power", `${(power / 1000).toFixed(power >= 1000 ? 1 : 2)}kW ${parrow}`, "", em.power) : "",
-        slope != null ? chip("slope", `${slope >= 0 ? "+" : ""}${slope.toFixed(2)}`, "", this._ent.slope) : "",
-        a.strategy ? chip("strategy", a.strategy) : "",
-        a.is_night ? chip("", "☾ night", "soft") : "",
-        a.safety_state && a.safety_state !== "normal" ? chip("safety", a.safety_state, "warn") : "",
-      ].join("");
-
-      // Sensor freshness: when did the regulated source thermometer last report?
-      // (the controller freezes on a stale reading, so surfacing it is useful)
-      const freshEnt = em.comfort || em.temp || this._ent.comfort;
-      let freshHtml = "";
-      const fst = freshEnt ? this._hass.states[freshEnt] : null;
-      if (fst) {
-        const lu = (fst.last_reported && fst.last_reported > fst.last_updated)
-          ? fst.last_reported : fst.last_updated;
-        const d = lu ? new Date(lu) : null;
-        if (d && !isNaN(d)) {
-          const ageS = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
-          const ago = ageS < 60 ? "just now"
-            : ageS < 3600 ? `${Math.floor(ageS / 60)}m ago`
-            : `${Math.floor(ageS / 3600)}h ${Math.floor((ageS % 3600) / 60)}m ago`;
-          const hhmmss = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
-          const stale = ageS > 20 * 60 ? " stale" : "";
-          freshHtml = `<div class="freshness clk${stale}" data-action="more" data-entity="${freshEnt}">updated ${hhmmss} · ${ago}</div>`;
+      const short = [vm.powerEntity, vm.acEntity].filter(Boolean);
+      if (short.length) ask(POWER_HOURS, short).then((res) => {
+        const raw = [];
+        for (const p of (res && res[vm.powerEntity]) || []) {
+          const w = fnum(p.s);
+          const lu = p.lu != null ? p.lu : p.last_updated;
+          if (w != null && lu != null) raw.push({ ms: lu * 1000, w });
         }
-      }
-
-      this.shadowRoot.getElementById("hd").innerHTML = `
-        <div class="hd-top">
-          <div class="zone card-header">${this._config.title || this._ent.zoneName}</div>
-          <button class="toggle ${enableOn ? "on" : ""}" data-action="toggle"
-                  title="${enableOn ? "Controller on" : "Controller off"}" role="switch"
-                  aria-checked="${enableOn}"><span class="knob"></span></button>
-        </div>
-        <div class="hero">
-          <span class="feel clk" style="color:${C.warm}" data-action="more" data-entity="${feelEnt}"
-            >${comfort != null ? comfort.toFixed(1) : "–"}<span class="deg">°</span></span>
-          <span class="arrow">→</span>
-          <span class="goal clk" style="color:${C.cool}" data-action="more" data-entity="${em.status || this._config.zone}"
-            >${target != null ? target.toFixed(1) : "–"}<span class="deg">°</span></span>
-          <span class="band">−${bandLow.toFixed(1)} / +${bandHigh.toFixed(1)}</span>
-        </div>
-        <div class="statusline">
-          <span class="pill clk" style="--c:${meta.color}" data-action="more" data-entity="${feelEnt}">${pillLabel}</span>
-          <span class="reason">${a.reason || ""}</span>
-        </div>
-        ${freshHtml}
-        <div class="chips">${chips}</div>`;
-    }
-
-    // -- tuning: strategy segmented + steppers --------------------------------
-    _renderTune(status) {
-      const cur = this._st(this._ent.strategy)?.state || status.attributes.strategy || "baby";
-      const seg = STRATEGIES.map((s) =>
-        `<button class="segbtn ${s === cur ? "sel" : ""}" data-action="strategy" data-val="${s}">${s}</button>`
-      ).join("");
-
-      // `signed` renders a below-target offset as a negative value with the
-      // buttons matching temperature direction: "+" warms the floor (toward
-      // target → smaller magnitude), "–" cools it (further below → larger).
-      const stepper = (id, label, signed = false) => {
-        const st = this._st(id);
-        if (!st) return "";
-        const v = fnum(st.state);
-        const unit = st.attributes.unit_of_measurement || "";
-        const disp = v == null ? "–" : (signed ? `−${Math.abs(v).toFixed(2)}` : v);
-        const lDir = signed ? 1 : -1;   // left "–"
-        const rDir = signed ? -1 : 1;   // right "+"
-        return `<div class="stepper">
-            <span class="sk">${label}</span>
-            <button class="sb" data-action="num" data-id="${id}" data-dir="${lDir}">–</button>
-            <span class="sv">${disp}${unit}</span>
-            <button class="sb" data-action="num" data-id="${id}" data-dir="${rDir}">+</button>
-          </div>`;
-      };
-
-      const fanAssistSt = this._st(this._ent.fanAssist);
-      const fanOn = fanAssistSt ? fanAssistSt.state === "on" : true;
-      const fanRow = fanAssistSt ? `
-        <div class="ctl">
-          <span class="sk">fan assist</span>
-          <button class="toggle sm ${fanOn ? "on" : ""}" data-action="fan_assist" role="switch"
-                  aria-checked="${fanOn}" title="${fanOn ? "Fan enabled" : "Fan disabled"}"><span class="knob"></span></button>
-        </div>` : "";
-
-      // Only the everyday knobs live on the card; fan-max / hard limits / the
-      // inactive band variant stay on the device page. "band high" targets
-      // whichever high band is in effect now (fan-on vs fan-off) so it always
-      // matches the −low/+high shown in the header.
-      const bandHighEnt = fanOn ? this._ent.bandHigh : this._ent.bandHighNoFan;
-
-      this.shadowRoot.getElementById("tune").innerHTML = `
-        <div class="seg">${seg}</div>
-        ${fanRow}
-        <div class="steppers">
-          ${stepper(this._ent.bandLow, "band low", true)}
-          ${stepper(bandHighEnt, "band high")}
-        </div>`;
-    }
-
-    // -- history: sparkline + decision stream --------------------------------
-    _renderHistory(status) {
-      const log = Array.isArray(status.attributes.recent_log) ? status.attributes.recent_log : [];
-      const host = this.shadowRoot.getElementById("hist");
-      if (!log.length) {
-        host.innerHTML = `<div class="empty">No decisions yet. The controller only logs when it acts — a quiet log means it's holding steady.</div>`;
-        return;
-      }
-      host.innerHTML = `
-        ${this._sparkline(log)}
-        <div class="stream">${log.slice().reverse().map((e) => this._logRow(e)).join("")}</div>`;
-    }
-
-    _logRow(e) {
-      const meta = MODES[e.mode] || { label: e.mode, color: C.grey };
-      // e.t is a UTC ISO timestamp; parse and render in the viewer's local time.
-      const d = e.t ? new Date(e.t) : null;
-      const t = d && !isNaN(d)
-        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
-        : "";
-      const acts = (e.actions || [])
-        .map((x) => (x.startsWith("blower=") ? `blower=${blowerLabel(x.slice(7))}` : x))
-        .join(" · ");
-      return `<div class="row">
-          <span class="t">${t}</span>
-          <span class="rpill" style="--c:${meta.color}">${meta.label}</span>
-          <span class="racts">${acts}</span>
-          <span class="rreason">${e.reason || ""}</span>
-        </div>`;
-    }
-
-    // comfort vs target sparkline (°C, one axis) + a thin power strip (W).
-    _sparkline(log) {
-      const cs = log.map((e) => fnum(e.comfort));
-      const ts = log.map((e) => fnum(e.target));
-      const ps = log.map((e) => fnum(e.power));
-      const vals = [...cs, ...ts].filter((v) => v != null);
-      if (vals.length < 2) return "";
-      const lo = Math.min(...vals) - 0.2, hi = Math.max(...vals) + 0.2;
-      const W = 300, H = 54, n = log.length;
-      const x = (i) => (n <= 1 ? 0 : (i / (n - 1)) * W);
-      const y = (v) => H - ((v - lo) / (hi - lo || 1)) * H;
-      const path = (arr) => {
-        let d = "", started = false;
-        arr.forEach((v, i) => { if (v == null) return; d += (started ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1) + " "; started = true; });
-        return d.trim();
-      };
-      const lastC = [...cs].reverse().find((v) => v != null);
-      const lastT = [...ts].reverse().find((v) => v != null);
-
-      // power strip (separate axis — never share a y-scale with °C)
-      let strip = "";
-      const pv = ps.filter((v) => v != null);
-      if (pv.length >= 2) {
-        const plo = Math.min(...pv), phi = Math.max(...pv);
-        const py = (v) => 20 - ((v - plo) / (phi - plo || 1)) * 18 - 1;
-        let d = "M0 20 ";
-        ps.forEach((v, i) => { if (v != null) d += "L" + x(i).toFixed(1) + " " + py(v).toFixed(1) + " "; });
-        d += `L${W} 20 Z`;
-        strip = `<div class="striplbl">system power</div>
-          <svg viewBox="0 0 ${W} 20" preserveAspectRatio="none" class="strip">
-            <path d="${d}" fill="${C.teal}" fill-opacity="0.22" stroke="${C.teal}" stroke-width="1"/></svg>`;
-      }
-
-      return `<div class="spark">
-        <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="sparksvg">
-          <path d="${path(ts)}" fill="none" stroke="${C.cool}" stroke-width="2" stroke-linejoin="round"/>
-          <path d="${path(cs)}" fill="none" stroke="${C.warm}" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div class="sparklbl">
-          <span style="color:${C.warm}">● feel ${lastC != null ? lastC.toFixed(1) + "°" : ""}</span>
-          <span style="color:${C.cool}">● target ${lastT != null ? lastT.toFixed(1) + "°" : ""}</span>
-        </div>
-        ${strip}
-      </div>`;
-    }
-
-    // -- schedule editor -----------------------------------------------------
-    _schedData(status) {
-      if (this._draft) return this._draft;
-      const s = status.attributes.schedule;
-      if (Array.isArray(s) && s.length === SLOTS) return s.map(Number);
-      return new Array(SLOTS).fill(26);
-    }
-
-    _renderSchedule(status) {
-      const data = this._schedData(status);
-      const W = 320, H = 160, padL = 26, padR = 8, padT = 10, padB = 20;
-      const iw = W - padL - padR, ih = H - padT - padB;
-      const X = (i) => padL + (i / (SLOTS - 1)) * iw;
-      const Y = (t) => padT + ((this._tmax - t) / (this._tmax - this._tmin)) * ih;
-      const now = new Date();
-      const nowFrac = (now.getHours() * 60 + now.getMinutes()) / 1440;
-      const nowX = padL + nowFrac * iw;
-      const nowHf = nowFrac * 24;
-      const nowSlot = clamp(Math.floor((now.getHours() * 60 + now.getMinutes()) / 30), 0, SLOTS - 1);
-      if (this._sel == null) this._sel = nowSlot;   // open on the current time
-
-      const comfort = fnum(this._st(this._ent.comfort)?.state);
-      let line = "", area = `M${X(0)} ${padT + ih} `;
-      data.forEach((t, i) => { line += (i ? "L" : "M") + X(i).toFixed(1) + " " + Y(clamp(t, this._tmin, this._tmax)).toFixed(1) + " "; });
-      data.forEach((t, i) => { area += "L" + X(i).toFixed(1) + " " + Y(clamp(t, this._tmin, this._tmax)).toFixed(1) + " "; });
-      area += `L${X(SLOTS - 1)} ${padT + ih} Z`;
-
-      const grid = [0, 6, 12, 18, 24].map((h) => {
-        const gx = padL + (h / 24) * iw;
-        return `<line x1="${gx}" y1="${padT}" x2="${gx}" y2="${padT + ih}" class="grid"/>
-                <text x="${gx}" y="${H - 5}" class="axl" text-anchor="middle">${h}</text>`;
-      }).join("");
-      // Y ticks that fit the (configurable) range: whole degrees inside it, or
-      // min/mid/max if the range is narrower than ~2°.
-      const ytickVals = [];
-      for (let t = Math.ceil(this._tmin); t <= Math.floor(this._tmax); t++) ytickVals.push(t);
-      if (ytickVals.length < 2) {
-        const mid = Math.round((this._tmin + this._tmax) * 5) / 10;  // 0.1 precision
-        ytickVals.length = 0;
-        ytickVals.push(this._tmin, mid, this._tmax);
-      }
-      const fmtTick = (t) => (Number.isInteger(t) ? `${t}` : t.toFixed(1));
-      const yticks = ytickVals.map((t) =>
-        `<text x="${padL - 5}" y="${Y(t) + 3}" class="axl" text-anchor="end">${fmtTick(t)}</text>
-         <line x1="${padL}" y1="${Y(t)}" x2="${W - padR}" y2="${Y(t)}" class="grid faint"/>`).join("");
-
-      const dots = data.map((t, i) =>
-        `<circle cx="${X(i).toFixed(1)}" cy="${Y(clamp(t, this._tmin, this._tmax)).toFixed(1)}" r="2" class="dot"/>`).join("");
-
-      const nowDot = comfort != null
-        ? `<circle cx="${nowX.toFixed(1)}" cy="${Y(clamp(comfort, this._tmin, this._tmax)).toFixed(1)}" r="4" fill="${C.warm}" stroke="var(--card-background-color)" stroke-width="1.5"/>`
-        : "";
-
-      // A prominent handle on the SELECTED point (tap-to-select target).
-      let selHandle = "";
-      if (this._sel != null && data[this._sel] != null) {
-        const sx = X(this._sel), sy = Y(clamp(data[this._sel], this._tmin, this._tmax));
-        selHandle = `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="6"
-          fill="var(--card-background-color)" stroke="var(--primary-color)" stroke-width="2.5"/>`;
-      }
-
-      // Value badge "HH:MM · 26.4°" — for the dragged/hovered point if active,
-      // otherwise the selected point (persistent) — so you read the exact target.
-      let badgeI = null, badgeT = null;
-      if (this._activeEdit) { badgeI = this._activeEdit.i; badgeT = this._activeEdit.t; }
-      else if (this._sel != null) { badgeI = this._sel; badgeT = data[this._sel]; }
-      let editBadge = "";
-      if (badgeI != null && badgeT != null) {
-        const i = badgeI, t = badgeT;
-        const bx = X(i), by = Y(clamp(t, this._tmin, this._tmax));
-        const hh = String(Math.floor(i / 2)).padStart(2, "0");
-        const mm = i % 2 ? "30" : "00";
-        const bw = 70;
-        const tx = clamp(bx, padL + bw / 2, W - padR - bw / 2);
-        const ty = clamp(by - 12, padT + 15, padT + ih);
-        editBadge = `<g text-anchor="middle" style="pointer-events:none">
-            <rect x="${(tx - bw / 2).toFixed(1)}" y="${(ty - 13).toFixed(1)}" width="${bw}" height="16" rx="4" fill="var(--primary-color)"/>
-            <text x="${tx.toFixed(1)}" y="${(ty - 1).toFixed(1)}" font-size="10.5" font-weight="700" fill="var(--text-primary-color, #fff)">${hh}:${mm} · ${t.toFixed(1)}°</text>
-            <circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="4" fill="var(--primary-color)" stroke="var(--card-background-color)" stroke-width="1.5"/>
-          </g>`;
-      }
-
-      // Actual comfort on the same axes as the target, mapped by hour-of-day.
-      // Each calendar-day bucket is contiguous (hour-of-day only increases within
-      // a day) so each is a single clean polyline — no seam handling needed.
-      // Today = SOLID (00:00 → now). Yesterday = a THIN solid line, drawn only for
-      // the part of the day that hasn't happened yet (now → 24) — so together they
-      // read as one continuous rolling trace with no overlap.
-      const XA = (hf) => padL + (clamp(hf, 0, 24) / 24) * iw;
-      const act = this._actual || { today: [], yesterday: [] };
-      const buildPath = (pts) => {
-        if (!pts || !pts.length) return "";
-        let d = "";
-        pts.forEach((p, i) => { d += (i ? "L" : "M") + XA(p.hf).toFixed(1) + " " + Y(clamp(p.t, this._tmin, this._tmax)).toFixed(1) + " "; });
-        return d.trim();
-      };
-      const yPath = buildPath((act.yesterday || []).filter((p) => p.hf >= nowHf));
-      const tPath = buildPath(act.today);
-      let actualLine = "";
-      if (yPath) actualLine += `<path d="${yPath}" fill="none" stroke="${C.warm}" stroke-width="1" stroke-opacity="0.5" stroke-linejoin="round" stroke-linecap="round"/>`;
-      if (tPath) actualLine += `<path d="${tPath}" fill="none" stroke="${C.warm}" stroke-width="1.5" stroke-opacity="0.9" stroke-linejoin="round" stroke-linecap="round"/>`;
-
-      this.shadowRoot.getElementById("sched").innerHTML = `
-        <svg id="sched-svg" viewBox="0 0 ${W} ${H}" class="schedsvg" touch-action="none">
-          <defs>
-            <linearGradient id="czgrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="${C.warm}" stop-opacity="0.28"/>
-              <stop offset="100%" stop-color="${C.cool}" stop-opacity="0.10"/>
-            </linearGradient>
-          </defs>
-          ${yticks}${grid}
-          <path d="${area}" fill="url(#czgrad)"/>
-          ${actualLine}
-          <path d="${line}" fill="none" stroke="var(--primary-color)" stroke-width="2" stroke-linejoin="round"/>
-          ${dots}
-          <line x1="${nowX.toFixed(1)}" y1="${padT}" x2="${nowX.toFixed(1)}" y2="${padT + ih}" class="now"/>
-          ${nowDot}
-          ${selHandle}
-          ${editBadge}
-        </svg>
-        <div class="sched-edit">
-          <div class="se-grp">
-            <button class="se-btn" data-action="sel-move" data-d="-1" aria-label="earlier">‹</button>
-            <span class="se-lab">${String(Math.floor((this._sel ?? 0) / 2)).padStart(2, "0")}:${(this._sel ?? 0) % 2 ? "30" : "00"}</span>
-            <button class="se-btn" data-action="sel-move" data-d="1" aria-label="later">›</button>
-          </div>
-          <div class="se-grp">
-            <button class="se-btn" data-action="sel-adj" data-d="-1" aria-label="cooler">−</button>
-            <span class="se-lab val">${(data[this._sel ?? 0] ?? 26).toFixed(1)}°</span>
-            <button class="se-btn" data-action="sel-adj" data-d="1" aria-label="warmer">+</button>
-          </div>
-        </div>
-        <div class="hint">Tap a point to select · drag to sketch · nudge with the buttons
-          <span class="lg"><i class="sw" style="background:var(--primary-color)"></i>target</span>
-          <span class="lg"><i class="sw" style="background:${C.warm}"></i>actual today</span>
-          <span class="lg"><i class="sw" style="background:${C.warm};opacity:.5;height:1px"></i>yesterday (ahead)</span></div>`;
-
-      const svg = this.shadowRoot.getElementById("sched-svg");
-      const geo = { W, H, padL, padR, padT, padB, iw, ih, X, Y };
-      const evToVal = (ev) => {
-        const r = svg.getBoundingClientRect();
-        const sx = ((ev.clientX - r.left) / r.width) * W;
-        const sy = ((ev.clientY - r.top) / r.height) * H;
-        const i = clamp(Math.round(((sx - padL) / iw) * (SLOTS - 1)), 0, SLOTS - 1);
-        const t = clamp(snap(this._tmax - ((sy - padT) / ih) * (this._tmax - this._tmin), 0.1), this._tmin, this._tmax);
-        return { i, t };
-      };
-      let lastI = null, startX = 0, startY = 0;
-      const MOVE_THRESH = 5;   // svg units of movement before a press becomes a sketch
-      const paint = (ev) => {
-        const { i, t } = evToVal(ev);
-        const d = this._draft || this._schedData(status).slice();
-        if (lastI != null && Math.abs(i - lastI) > 1) { // interpolate across a fast drag
-          const a = Math.min(i, lastI), b = Math.max(i, lastI);
-          const va = d[lastI], vb = t;
-          for (let k = a; k <= b; k++) d[k] = i === lastI ? t : va + (vb - va) * ((k - lastI) / (i - lastI || 1));
-        } else { d[i] = t; }
-        lastI = i;
-        this._draft = d;
-        this._sel = i;                 // selection follows the sketch
-        this._activeEdit = { i, t };   // drives the value badge
-        this._markDirty(true);
-        this._renderScheduleQuiet(status);
-      };
-      svg.addEventListener("pointerdown", (ev) => {
-        ev.preventDefault();
-        const { i } = evToVal(ev);
-        this._sel = i;                 // TAP = select (non-destructive)
-        this._dragging = false; lastI = null; this._hoverI = null;
-        const r = svg.getBoundingClientRect();
-        startX = ((ev.clientX - r.left) / r.width) * W;
-        startY = ((ev.clientY - r.top) / r.height) * H;
-        svg.setPointerCapture(ev.pointerId);
-        this._renderScheduleQuiet(status);   // show the selection immediately
-      });
-      svg.addEventListener("pointermove", (ev) => {
-        if (ev.buttons) {              // pressed → sketch once it moves past threshold
-          if (!this._dragging) {
-            const r = svg.getBoundingClientRect();
-            const sx = ((ev.clientX - r.left) / r.width) * W;
-            const sy = ((ev.clientY - r.top) / r.height) * H;
-            if (Math.abs(sx - startX) < MOVE_THRESH && Math.abs(sy - startY) < MOVE_THRESH) return;
-            this._dragging = true;
-          }
-          paint(ev);
-          return;
+        raw.sort((a, b) => a.ms - b.ms);
+        // The meter can sample every few seconds; the strip is 300 px wide. Bucket
+        // to the PEAK of each minute-ish bucket, so a short spike still shows.
+        const t0 = nowMs - POWER_HOURS * 3600 * 1000, bucket = 60 * 1000;
+        const pts = [];
+        let max = 0;
+        for (const q of raw) {
+          if (q.ms < t0) continue;   // the recorder may return more than we asked for
+          const b = Math.floor((q.ms - t0) / bucket);
+          const prev = pts[pts.length - 1];
+          if (prev && prev.b === b) prev.w = Math.max(prev.w, q.w);
+          else pts.push({ b, ms: t0 + b * bucket, w: q.w });
+          if (q.w > max) max = q.w;
         }
-        // Hover (mouse only, not pressed): show that point's value — non-destructive.
-        const { i } = evToVal(ev);
-        if (i === this._hoverI) return;
-        this._hoverI = i;
-        this._activeEdit = { i, t: this._schedData(status)[i] };
-        this._renderScheduleQuiet(status);
-      });
-      const end = () => {
-        this._dragging = false; lastI = null; this._activeEdit = null; this._hoverI = null;
-        this._renderScheduleQuiet(status);  // keep the selection; clear the transient badge
-      };
-      svg.addEventListener("pointerup", end);
-      svg.addEventListener("pointercancel", end);
-      svg.addEventListener("pointerleave", () => {
-        if (this._dragging || this._activeEdit == null) return;
-        this._hoverI = null; this._activeEdit = null;
-        this._renderScheduleQuiet(status);   // hide the badge when the pointer leaves
-      });
-    }
-
-    // re-render only the SVG paths during a drag (cheap, no listener churn cost matters)
-    _renderScheduleQuiet(status) {
-      // Reuse the full renderer but keep dragging=true so _update won't fight it.
-      this._renderSchedule(status);
-    }
-
-    _markDirty(dirty) {
-      const save = this.shadowRoot.getElementById("btn-save");
-      const rev = this.shadowRoot.getElementById("btn-revert");
-      if (save) save.disabled = !dirty;
-      if (rev) rev.disabled = !dirty;
+        // Setpoint changes are the commands the strip is evidence against.
+        const sp = [];
+        for (const q of attrs(res && res[vm.acEntity], "temperature")) {
+          if (!sp.length || sp[sp.length - 1].v !== q.v) sp.push({ ms: q.ms, v: q.v });
+        }
+        this._powerHist = pts.length
+          ? { pts, sp: sp.filter((q) => q.ms >= t0), max, t0, t1: nowMs } : null;
+        this._histStamp++;
+        this._update();
+      }).catch(() => { /* no history → no strip */ });
     }
 
     // -- interactions --------------------------------------------------------
     _onClick(e) {
       const el = e.target.closest("[data-action]");
-      if (!el || !this._hass) return;
-      const action = el.dataset.action;
+      if (!el || !this._hass || !this._vm) return;
       const hass = this._hass;
-      if (action === "more") {
-        const entityId = el.dataset.entity;
-        if (entityId) {
-          this.dispatchEvent(new CustomEvent("hass-more-info", {
-            detail: { entityId }, bubbles: true, composed: true,
-          }));
+      const ent = this._vm.ent;
+      switch (el.dataset.action) {
+        case "more": {
+          const entityId = el.dataset.entity;
+          if (entityId) {
+            this.dispatchEvent(new CustomEvent("hass-more-info", {
+              detail: { entityId }, bubbles: true, composed: true,
+            }));
+          }
+          break;
         }
-      } else if (action === "toggle") {
-        const st = this._st(this._ent.enable);
-        const on = st && st.state === "on";
-        hass.callService("switch", on ? "turn_off" : "turn_on", { entity_id: this._ent.enable });
-      } else if (action === "fan_assist") {
-        const st = this._st(this._ent.fanAssist);
-        const on = st && st.state === "on";
-        hass.callService("switch", on ? "turn_off" : "turn_on", { entity_id: this._ent.fanAssist });
-      } else if (action === "strategy") {
-        hass.callService("select", "select_option", { entity_id: this._ent.strategy, option: el.dataset.val });
-      } else if (action === "num") {
-        const id = el.dataset.id, dir = +el.dataset.dir;
-        const st = this._st(id); if (!st) return;
-        const step = fnum(st.attributes.step) || 0.5;
-        const v = clamp((fnum(st.state) || 0) + dir * step,
-          fnum(st.attributes.min) ?? -Infinity, fnum(st.attributes.max) ?? Infinity);
-        hass.callService("number", "set_value", { entity_id: id, value: +v.toFixed(2) });
-      } else if (action === "save") {
-        if (!this._draft) return;
-        hass.callService("comfort_zone", "set_schedule", {
-          name: this._ent.zoneName, schedule: this._draft.map((v) => +(+v).toFixed(1)),
-        });
-        this._draft = null; this._markDirty(false);
-      } else if (action === "revert") {
-        this._draft = null; this._markDirty(false);
-        this._renderSchedule(this._st(this._config.zone));
-      } else if (action === "sel-move") {
-        this._sel = clamp((this._sel ?? 0) + (+el.dataset.d), 0, SLOTS - 1);
-        this._renderSchedule(this._st(this._config.zone));
-      } else if (action === "sel-adj") {
-        if (this._sel == null) return;
-        const d = this._draft || this._schedData(this._st(this._config.zone)).slice();
-        d[this._sel] = clamp(snap((+d[this._sel] || 26) + (+el.dataset.d) * 0.1, 0.1), this._tmin, this._tmax);
-        this._draft = d; this._markDirty(true);
-        this._renderSchedule(this._st(this._config.zone));
+        case "why":
+          this.showWhy = !this._why;
+          break;
+        case "toggle":
+          hass.callService("switch", hass.states[ent.enable]?.state === "on" ? "turn_off" : "turn_on",
+            { entity_id: ent.enable });
+          break;
+        case "fan_assist":
+          hass.callService("switch", hass.states[ent.fanAssist]?.state === "on" ? "turn_off" : "turn_on",
+            { entity_id: ent.fanAssist });
+          break;
+        case "strategy":
+          hass.callService("select", "select_option",
+            { entity_id: ent.strategy, option: el.dataset.val });
+          break;
+        case "num": {
+          const id = el.dataset.id;
+          const st = hass.states[id];
+          if (!st) return;
+          const step = fnum(st.attributes.step) || 0.5;
+          const v = clamp((fnum(st.state) || 0) + +el.dataset.dir * step,
+            fnum(st.attributes.min) ?? -Infinity, fnum(st.attributes.max) ?? Infinity);
+          hass.callService("number", "set_value", { entity_id: id, value: +v.toFixed(2) });
+          break;
+        }
+        case "save": this._editor.save(); break;
+        case "revert": this._editor.revert(); break;
       }
     }
   }
@@ -817,9 +1290,13 @@
     .hero { display:flex; align-items:baseline; flex-wrap:wrap; gap:8px; margin:6px 0 2px;
       font-variant-numeric: tabular-nums; }
     .feel, .goal { font-size: 40px; font-weight: 300; line-height:1; }
+    /* the goal is a range, so it needs room the single number never did */
+    .goal.zone { font-size: 30px; }
+    .dash { font-size: 20px; padding: 0 3px; color: var(--secondary-text-color); }
     .deg { font-size: 20px; font-weight: 400; }
     .arrow { font-size: 22px; color: var(--secondary-text-color); }
     .band { font-size: 13px; color: var(--secondary-text-color); align-self:center; }
+    .band.alt { font-size:11.5px; opacity:.85; }
     /* pill + reason share their own line below the numbers, so the pill's text
        length never reflows the temperature row */
     .statusline { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:2px 0 8px; }
@@ -827,6 +1304,37 @@
       border-radius:999px; color:var(--c); background: color-mix(in srgb, var(--c) 16%, transparent);
       border:1px solid color-mix(in srgb, var(--c) 40%, transparent); white-space:nowrap; }
     .reason { flex:1; min-width:0; font-size: 12.5px; color: var(--secondary-text-color); }
+    .whybtn { flex:none; font-size:11px; padding:2px 8px; border-radius:999px; cursor:pointer;
+      background:var(--secondary-background-color); color:var(--secondary-text-color);
+      border:1px solid var(--divider-color); letter-spacing:.04em; }
+    .whybtn:hover { color:var(--primary-text-color); }
+
+    /* why panel — the chain from the weather to the three actuators */
+    .why { margin:0 0 8px; padding:8px 10px; border-radius:8px;
+      background:var(--secondary-background-color); display:flex; flex-direction:column; gap:3px;
+      font-variant-numeric:tabular-nums; }
+    .wrow { display:grid; grid-template-columns: 62px 1fr max-content; gap:2px 8px; align-items:baseline; }
+    .wk { font-size:9.5px; text-transform:uppercase; letter-spacing:.06em; line-height:1.5;
+      color:var(--secondary-text-color); white-space:nowrap; }
+    .wv { font-size:11.5px; line-height:1.5; color:var(--primary-text-color);
+      font-family: var(--code-font-family, ui-monospace, SFMono-Regular, Menlo, monospace); }
+    .wv code { background:var(--card-background-color); border-radius:4px; padding:0 4px; }
+    .wm { font-size:10px; font-weight:700; white-space:nowrap; color:var(--secondary-text-color); }
+    .wm.ok { color:${C.ok}; } .wm.warn { color:${C.amber}; } .wm.cool { color:${C.cool}; }
+    .wsep { height:1px; background:var(--divider-color); opacity:.7; margin:4px 0 2px; }
+    .wflags { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:4px; }
+    .wflag { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.06em;
+      padding:3px 8px; border-radius:6px; color:var(--c);
+      background: color-mix(in srgb, var(--c) 18%, transparent);
+      border:1px solid color-mix(in srgb, var(--c) 45%, transparent); }
+    .wflag .wfx { font-weight:500; text-transform:none; letter-spacing:0; opacity:.95; }
+    .wid { margin-top:3px; font-size:9.5px; color:var(--secondary-text-color); opacity:.75; }
+    .wid code { font-family: var(--code-font-family, ui-monospace, Menlo, monospace);
+      background:var(--card-background-color); border-radius:4px; padding:0 4px; }
+    @media (max-width: 400px) {
+      .wrow { grid-template-columns: 58px 1fr; }
+      .wm { grid-column:2; grid-row:2; }
+    }
     .freshness { font-size:11px; color: var(--secondary-text-color); opacity:.85; margin:0 0 4px;
       width:max-content; }
     .freshness.clk { cursor:pointer; }
@@ -839,6 +1347,9 @@
     .chip.soft .v { color: var(--secondary-text-color); }
     .chip.warn { background: color-mix(in srgb, ${C.amber} 20%, transparent); }
     .chip.warn .v { color: ${C.amber}; }
+    /* a hold past the compressor dwell is the good outcome, so it gets to say so */
+    .chip.calm { background: color-mix(in srgb, ${C.ok} 18%, transparent); }
+    .chip.calm .v { color: ${C.ok}; }
     .up { color: ${C.cool}; } .dn { color: ${C.warm}; }
 
     /* enable toggle */
@@ -872,6 +1383,15 @@
     .se-lab { flex:1; text-align:center; font-size:15px; font-weight:600; font-variant-numeric:tabular-nums;
       color:var(--primary-text-color); }
     .se-lab.val { color:var(--primary-color); }
+    /* power strip — evidence under the chart, on its own 6 h axis */
+    .pwr { margin-top:10px; }
+    .pwrsvg { width:100%; height:auto; display:block; }
+    .pwrsvg .grid { stroke: var(--divider-color); stroke-width:1; }
+    .pwrsvg .grid.faint { stroke: var(--divider-color); opacity:.4; stroke-dasharray:2 3; }
+    .pwrsvg .axl { fill: var(--secondary-text-color); font-size:8.5px; }
+    .pwrsvg .axl.sp { fill: ${C.cool}; font-weight:600; }
+    .pwrsvg .sptick { stroke: ${C.cool}; stroke-width:1; opacity:.6; }
+
     .hint { font-size:11px; color: var(--secondary-text-color); margin-top:4px; text-align:center; }
     .hint .lg { margin-left:8px; white-space:nowrap; }
     .hint .sw { display:inline-block; width:9px; height:2px; border-radius:1px; margin-right:3px; vertical-align:middle; }
@@ -890,27 +1410,6 @@
     .sb { width:22px; height:22px; border-radius:6px; border:none; cursor:pointer; font-size:15px; line-height:1;
       background: var(--card-background-color); color:var(--primary-text-color); border:1px solid var(--divider-color); }
 
-    /* history */
-    .empty { font-size:12.5px; color:var(--secondary-text-color); padding:6px 0; }
-    .spark { margin-bottom:10px; }
-    .sparksvg { width:100%; height:54px; display:block; }
-    .strip { width:100%; height:20px; display:block; }
-    .sparklbl, .striplbl { font-size:10px; display:flex; gap:12px; margin-top:2px; color:var(--secondary-text-color); }
-    .striplbl { text-transform:uppercase; letter-spacing:.08em; margin-top:6px; }
-    .stream { max-height: 210px; overflow-y:auto; display:flex; flex-direction:column; gap:2px;
-      font-family: var(--code-font-family, ui-monospace, SFMono-Regular, Menlo, monospace); }
-    .row { display:grid; grid-template-columns: max-content max-content 1fr; grid-template-rows:auto auto;
-      align-items:baseline; gap:2px 8px; padding:5px 6px; border-radius:6px; }
-    .row:nth-child(odd) { background: var(--secondary-background-color); }
-    .t { font-size:11px; color:var(--secondary-text-color); grid-row:1; grid-column:1;
-      white-space:nowrap; font-variant-numeric:tabular-nums; }
-    .rpill { font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px; grid-column:2; grid-row:1;
-      white-space:nowrap; color:var(--c); background: color-mix(in srgb, var(--c) 16%, transparent); }
-    .racts { font-size:11px; color:var(--primary-text-color); grid-column:3; grid-row:1; text-align:right;
-      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
-    .rreason { font-size:11px; color:var(--secondary-text-color); grid-column:1 / -1; grid-row:2;
-      font-family: var(--primary-font-family, sans-serif); }
-
     /* click-to-history affordances */
     .clk { cursor:pointer; }
     .chip.clk:hover { background: color-mix(in srgb, var(--primary-color) 12%, var(--secondary-background-color)); }
@@ -923,7 +1422,7 @@
     .toggle.sm .knob { width:14px; height:14px; }
     .toggle.sm.on .knob { left:17px; }
 
-    @media (max-width: 420px) { .feel, .goal { font-size:32px; } .racts { display:none; } }
+    @media (max-width: 420px) { .feel, .goal { font-size:32px; } .goal.zone { font-size:24px; } }
     @media (prefers-reduced-motion: reduce) { .toggle, .toggle .knob { transition:none; } }
     :focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
   `;
@@ -933,7 +1432,7 @@
   window.customCards.push({
     type: "comfort-zone-card",
     name: "Comfort Zone Card",
-    description: "Control panel for a Comfort Zone: live state, drag-a-curve target schedule, tuning, and the controller's decision log.",
+    description: "Control panel for a Comfort Zone: live state, the loop's own numbers, a drag-a-curve target schedule and tuning.",
     preview: false,
   });
   console.info(`%c COMFORT-ZONE-CARD %c ${VERSION} `, "background:#3b8ff0;color:#fff;border-radius:3px 0 0 3px;padding:2px 4px", "background:#f0913b;color:#fff;border-radius:0 3px 3px 0;padding:2px 4px");

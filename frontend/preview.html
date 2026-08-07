@@ -43,40 +43,82 @@
     });
     const now = new Date();
     const t = (m)=> new Date(now-m*60000).toISOString();
-    const recent_log = [
-      {t:t(46), mode:"cooling", reason:"warm & AC off → power on, setpoint 25", actions:["ac_power=on","setpoint=25"], comfort:27.3, target:26.0, power:120},
-      {t:t(40), mode:"cooling", reason:"not engaged after 4m (Δpower≈+30W) → escalate to 24", actions:["setpoint=24"], comfort:27.2, target:26.0, power:150},
-      {t:t(33), mode:"fan_assist", reason:"mild warmth → fan on", actions:["fan=on","fan_level=18"], comfort:26.6, target:26.0, power:980},
-      {t:t(21), mode:"easing", reason:"cold (settled 25.6 < 25.6) → setpoint 25, quieter", actions:["setpoint=25","blower=低风"], comfort:25.6, target:26.0, power:1120},
-      {t:t(9),  mode:"managed_off", reason:"overcooling at setpoint ceiling → managed AC-off", actions:["ac_power=off","fan=off"], comfort:25.1, target:26.0, power:60},
-      {t:t(2),  mode:"cooling", reason:"managed-off return: comfort 26.0 ≥ target 26.0", actions:["ac_power=on","setpoint=25"], comfort:26.0, target:26.0, power:110},
-    ];
+    // The controller's decision trace, exactly as controller.tick publishes it.
+    // The loop holds a ZONE and produces no error inside it, so the two columns are
+    // the two cases worth reading: LIGHT is a hot afternoon at the setpoint floor
+    // (saturated, room above the zone), DARK is the room settled inside the zone
+    // with no fan available — the "deliberately doing nothing" state.
+    const decision = { y:26.90, settled:26.62, slope:0.031, target:26.05,
+      zone_lo:25.83, zone_hi:26.28, in_zone:false,
+      error:-0.34, u_ff:24.62, u_fb:-0.94, u:24.00, u_raw:23.68, integral:-0.51,
+      saturated:true, frozen:false,
+      sp:24, blower:1, trim:0.32, sp_dwell_left:0.0, sp_blocked_by_dwell:false,
+      hi:26.50, lo:25.60, outdoor:33.4, deliverable:[24.0, 27.0],
+      gain:0.50, dead_time:10.2, tau:8.0, kc:0.64, ti:8.0, blower_gain:0.30,
+      sp_observed:24 };
+    const decisionInZone = Object.assign({}, decision, {
+      y:25.90, settled:25.95, slope:-0.004, target:25.85,
+      zone_lo:25.63, zone_hi:26.08, in_zone:true,
+      error:0, u_ff:25.62, u_fb:-0.31, u:25.31, u_raw:25.31, integral:-0.18,
+      saturated:false, sp:25, blower:0, trim:0.00,
+      sp_dwell_left:4.2, sp_blocked_by_dwell:false, outdoor:29.1, sp_observed:25 });
     const S = "sensor.master_bedroom_status";
     const entMap = {
       status:S, ac:"climate.bedroom_ac", ac_power_switch:"switch.bedroom_ac_power",
       power:"sensor.ac_power", fan:"fan.bedroom_fan", fan_speed:"number.bedroom_fan_speed",
-      temp:"sensor.crib_temp", humidity:"sensor.crib_humidity", comfort:null };
+      temp:"sensor.crib_temp", humidity:"sensor.crib_humidity", comfort:null,
+      weather:"weather.home" };
     const states = {
       [S]: { entity_id:S, state:"cooling", attributes:{
-        friendly_name:"Master bedroom Status", reason:recent_log[recent_log.length-1].reason,
+        friendly_name:"Master bedroom Status",
+        reason:"asking for 23.7, 0.3°C past what the unit can deliver → setpoint 24, blower and fan take the rest",
+        branch:"pi.saturated_cold",
+        decision,
         strategy:"baby", safety_state:"normal", enabled:true, is_night:false,
-        slope:0.03, power:1120, power_delta:180, setpoint:25, fan_level:20, band_low:0.4, band_high:0.7,
-        ac_on:true, ac_state:"cool", ac_blower:"中风", fan_on:true, fan_assist_enabled:true,
-        entities:entMap, schedule, recent_log } },
-      "sensor.master_bedroom_comfort_temperature": {state:"26.1", attributes:{friendly_name:"Master bedroom Comfort temperature"}},
-      "sensor.crib_temp": {state:"25.9", last_updated:t(3), last_reported:t(3), attributes:{friendly_name:"Crib temperature", unit_of_measurement:"°C"}},
+        slope:0.031, outdoor:33.4, power:1120, power_recent:410, setpoint:24, sp_held_min:4.2,
+        fan_level:20, fan_on:true, fan_assist_enabled:true,
+        band_low:0.4, band_high:0.5, zone_lo:25.83, zone_hi:26.28,
+        hard_min:23.0, hard_max:29.0,
+        ac_on:true, ac_state:"cool", ac_blower:"中风",
+        fan_max_level:40, blower_max:"中风",
+        last_actions:["setpoint=24","blower=中风"],
+        entities:entMap, schedule } },
+      "weather.home": {state:"sunny", attributes:{friendly_name:"Home", temperature:33.4}},
+      "sensor.ac_power": {state:"1120", attributes:{friendly_name:"AC power", unit_of_measurement:"W"}},
+      "sensor.master_bedroom_comfort_temperature": {state:"26.9", attributes:{friendly_name:"Master bedroom Comfort temperature"}},
+      "sensor.crib_temp": {state:"26.7", last_updated:t(3), last_reported:t(3), attributes:{friendly_name:"Crib temperature", unit_of_measurement:"°C"}},
       "sensor.master_bedroom_target": {state:"26.0", attributes:{friendly_name:"Master bedroom Target"}},
-      "sensor.master_bedroom_predicted_settled": {state:"25.7", attributes:{friendly_name:"Master bedroom Predicted settled"}},
+      "sensor.master_bedroom_predicted_settled": {state:"26.62", attributes:{friendly_name:"Master bedroom Predicted settled"}},
       "select.master_bedroom_strategy": {state:"baby", attributes:{friendly_name:"Master bedroom Strategy"}},
+      "select.master_bedroom_ac_blower_max_day": {state:"中风", attributes:{friendly_name:"Master bedroom AC blower max (day)", options:["低风","中风"]}},
+      "select.master_bedroom_ac_blower_max_night": {state:"低风", attributes:{friendly_name:"Master bedroom AC blower max (night)", options:["低风","中风"]}},
       "switch.master_bedroom_enabled": {state:"on", attributes:{friendly_name:"Master bedroom Enabled"}},
       "switch.master_bedroom_fan_assist": {state:"on", attributes:{friendly_name:"Master bedroom Fan assist"}},
       "number.master_bedroom_band_low": {state:"0.4", attributes:{friendly_name:"Master bedroom Band low (cold side)", unit_of_measurement:"°C", step:0.05, min:0.1, max:1.5}},
-      "number.master_bedroom_band_high": {state:"0.7", attributes:{friendly_name:"Master bedroom Band high (fan on)", unit_of_measurement:"°C", step:0.05, min:0.1, max:1.5}},
-      "number.master_bedroom_band_high_no_fan": {state:"0.4", attributes:{friendly_name:"Master bedroom Band high (fan off)", unit_of_measurement:"°C", step:0.05, min:0.1, max:1.5}},
-      "number.master_bedroom_fan_max_day": {state:"40", attributes:{friendly_name:"Master bedroom Fan max (day)", unit_of_measurement:"%", step:5, min:10, max:100}},
+      "number.master_bedroom_band_high": {state:"0.5", attributes:{friendly_name:"Master bedroom Band high (warm side)", unit_of_measurement:"°C", step:0.05, min:0.1, max:1.5}},
+      "number.master_bedroom_no_fan_offset": {state:"0.2", attributes:{friendly_name:"Master bedroom Cooler when fan off", unit_of_measurement:"°C", step:0.05, min:0.0, max:1.0}},
+      "number.master_bedroom_fan_max_day": {state:"40", attributes:{friendly_name:"Master bedroom Fan max (day)", unit_of_measurement:"%", step:5, min:0, max:100}},
+      "number.master_bedroom_fan_max_night": {state:"0", attributes:{friendly_name:"Master bedroom Fan max (night)", unit_of_measurement:"%", step:5, min:0, max:100}},
       "number.master_bedroom_hard_min_safety": {state:"23", attributes:{friendly_name:"Master bedroom Hard min (safety)", unit_of_measurement:"°C", step:0.5, min:20, max:26}},
       "number.master_bedroom_hard_max_safety": {state:"29", attributes:{friendly_name:"Master bedroom Hard max (safety)", unit_of_measurement:"°C", step:0.5, min:27, max:32}},
     };
+    // The DARK column is the same zone in the other state worth reading: settled
+    // inside the zone, no fan available, so the zone sits a further no_fan_offset
+    // below the schedule. Only the status sensor differs, so the registry, the
+    // knobs and the history mock are shared.
+    const statesInZone = Object.assign({}, states, {
+      [S]: { entity_id:S, state:"idle", attributes:Object.assign({}, states[S].attributes, {
+        reason:"settles 25.95, inside [25.63, 26.08] → u 25.31 = ff 25.62 -0.31 fb → setpoint 25",
+        branch:"pi.in_zone",
+        decision:decisionInZone,
+        slope:-0.004, outdoor:29.1, power:640, power_recent:-260, setpoint:25, sp_held_min:80.6,
+        fan_level:0, fan_on:false,
+        zone_lo:25.63, zone_hi:26.08,
+        ac_blower:"低风", fan_max_level:0, blower_max:"低风",
+        last_actions:[] }) },
+      "sensor.master_bedroom_comfort_temperature": {state:"25.9", attributes:{friendly_name:"Master bedroom Comfort temperature"}},
+    });
+
     const entities = {}; Object.keys(states).forEach(id=>entities[id]={entity_id:id, device_id:"dev1"});
     // Mock a ~48h comfort trace so BOTH calendar-day buckets populate: today
     // (solid, 00:00→now) and yesterday (dotted, full day).
@@ -90,17 +132,61 @@
       }
       return pts;
     }
-    const hass = { states, entities, devices:{dev1:{name:"Master bedroom"}},
-      callService:(d,s,data)=>{ console.log("callService", d, s, data); return Promise.resolve(); },
-      callWS:(msg)=>{
-        if (msg && msg.type==="history/history_during_period" && msg.entity_ids)
-          return Promise.resolve({ [msg.entity_ids[0]]: genTrace() });
-        return Promise.resolve({});
-      } };
-    for (const id of ["a","b"]) {
+    // Outdoor lives in the weather entity's ATTRIBUTES, and runs 25–33° against a
+    // 25–27° chart window — the case the overlay's own scale exists for.
+    function genOutdoor(){
+      const pts=[]; const now=Date.now();
+      for (let m=48*60; m>=0; m-=30) {
+        const ts = now - m*60000; const d = new Date(ts);
+        const h = d.getHours() + d.getMinutes()/60;
+        const temp = 29 + 4*Math.sin((h-9)/24*2*Math.PI);
+        pts.push({ s:"sunny", lu: Math.floor(ts/1000), a:{ temperature:+temp.toFixed(1) } });
+      }
+      return pts;
+    }
+    // A compressor cycling under a whole-house baseline, with one kettle spike.
+    function genPower(){
+      const pts=[]; const now=Date.now();
+      for (let m=6*60; m>=0; m-=1) {
+        const ts = now - m*60000;
+        const duty = Math.sin(m/11) > -0.2 ? 1 : 0;
+        let w = 260 + duty*(780 + 160*Math.sin(m/3));
+        if (m > 96 && m < 103) w += 1450;
+        pts.push({ s: Math.round(w), lu: Math.floor(ts/1000) });
+      }
+      return pts;
+    }
+    // The climate entity's setpoint is an attribute too; the strip ticks its changes.
+    function genSetpoint(){
+      const pts=[]; const now=Date.now();
+      for (let m=6*60; m>=0; m-=5) {
+        const ts = now - m*60000;
+        // enough changes inside the 3 h strip to exercise the label staggering
+        const v = m>300 ? 26 : m>250 ? 25 : m>170 ? 24 : m>150 ? 25
+                : m>120 ? 24 : m>105 ? 25 : m>60 ? 24 : m>40 ? 25 : m>20 ? 24 : 25;
+        pts.push({ s:"cool", lu: Math.floor(ts/1000), a:{ temperature:v } });
+      }
+      return pts;
+    }
+    const callWS = (msg)=>{
+      if (msg && msg.type==="history/history_during_period" && msg.entity_ids) {
+        const out = {};
+        for (const id of msg.entity_ids) {
+          out[id] = id.startsWith("weather.") ? genOutdoor()
+            : id.startsWith("climate.") ? genSetpoint()
+            : id === "sensor.ac_power" ? genPower() : genTrace();
+        }
+        return Promise.resolve(out);
+      }
+      return Promise.resolve({});
+    };
+    const base = { entities, devices:{dev1:{name:"Master bedroom"}}, callWS,
+      callService:(d,s,data)=>{ console.log("callService", d, s, data); return Promise.resolve(); } };
+    for (const [id, st] of [["a", states], ["b", statesInZone]]) {
       const el = document.getElementById(id);
       el.setConfig({ type:"custom:comfort-zone-card", zone:S, title:"空调温控2" });
-      el.hass = hass;
+      el.hass = Object.assign({ states: st }, base);
+      el.showWhy = true;   // the zone row is the point of both columns
     }
   </script>
 </body>
