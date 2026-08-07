@@ -59,8 +59,24 @@ class PiController:
     def reset(self) -> None:
         self.integral = 0.0
 
+    def restore(self, integral: float) -> None:
+        """Put back an integral this loop earned before a restart.
+
+        The integral carries the whole difference between the reset curve and the load
+        the room really has — measured 0.5–0.8 °C of setpoint on this room — and it is
+        the only loop state not recomputed from scratch each tick. A restart therefore
+        handed the loop its feedforward's opinion of the load instead of the room's,
+        and the room walked toward its cold rail while it re-earned the difference:
+        three times on 08-07, once ending in a guard trip.
+
+        Only ever the loop's own converged value. Inferring one from the setpoint in
+        force instead is circular and measured worse — see DESIGN §9.9.
+        """
+        self.integral = float(integral)
+
     def step(self, *, error: float, u_ff: float, dt_min: float,
-             lo: float, hi: float, frozen: bool = False) -> PiOutput:
+             lo: float, hi: float, floor: float | None = None,
+             frozen: bool = False) -> PiOutput:
         """Advance one tick and return the requested and deliverable outputs.
 
         ``lo``/``hi`` are what the *output stage* can deliver, not the setpoint
@@ -68,16 +84,24 @@ class PiController:
         anti-windup has to unwind against the real boundary or it will hold the
         integral against a limit the actuator had already passed.
 
+        ``floor`` raises that cold end for this tick alone — the reading's veto on
+        any colder setpoint while the room is measurably cold. It clamps and
+        back-calculates like any other limit, because a limit the integrator cannot
+        see is one it winds up against. The windup *backstop* still spans the
+        actuator, though: a policy that lasts one tick says nothing about how much
+        authority the loop has overall.
+
         ``frozen`` suspends integration for a tick — used whenever the actuator is
-        not the controller's to move (the safety guard has the room, the AC is off,
-        or a managed-off is in progress). The proportional term still responds, so
-        the loop resumes from the right place rather than from a stale integral.
+        not the controller's to move (the safety guard has the room, or the AC is
+        off). The proportional term still responds, so the loop resumes from the
+        right place rather than from a stale integral.
         """
         m = self.params
         kc, ti = m.kc, m.ti_min
+        lo_eff = lo if floor is None else max(lo, min(hi, floor))
         u_fb = kc * error + self.integral
         u_raw = u_ff + u_fb
-        u = max(lo, min(hi, u_raw))
+        u = max(lo_eff, min(hi, u_raw))
 
         if not frozen:
             dt = max(0.0, min(dt_min, MAX_DT_MIN))

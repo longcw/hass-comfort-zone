@@ -18,13 +18,21 @@ Lessons from the prior 安全阈值 that oscillated are baked in:
   direction, so overheat always trips the instant the rail is crossed;
 * overheat cools at the setpoint **floor** with the blower/fan maxed (no −3
   overshoot blast);
-* every override uses the **reliable power switch**, never HVAC-mode;
+* power is **cut** with the reliable power switch, never with an HVAC-mode of "off"
+  — this VRF acknowledges that mode without acting on it. Putting the unit **back**
+  is not one command but a state the guard stays in until the unit reports itself
+  running (``STATE_RESTORING``): it asserts power, mode and a safe setpoint, and
+  asserts them again every tick until the unit agrees. One attempt is not a restore
+  on this proxy — on 08-07 10:48 a power-on issued with an immediate setpoint write
+  left the unit reporting off, with the setpoint applied, for the seven minutes until
+  a person started it by hand. **Nothing else can finish that job**, because the
+  controller may never switch an AC on, so the guard may not hand back until it has;
 * a **stale/unavailable sensor** stops optimization and parks the AC at a safe
-  fixed setpoint — we never act on stale data.
+  fixed setpoint — we never act on stale data — and releases any override in force
+  rather than leaving it latched on hardware nothing can then revise.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -58,6 +66,14 @@ OVERHEAT_UNDERSHOOT = 2   # °C the guard goes BELOW the optimizer's setpoint fl
 MIN_OFF_MIN = 3.0         # min minutes the overcool guard keeps power off (compressor)
 RETRIP_MARGIN = 0.3       # °C past hard_min needed to re-trip overcool during the cooldown
 FAILSAFE_SETPOINT = 26    # parked setpoint when the sensor is truly gone
+# The mode to put a unit back into when nothing better is remembered. This is a
+# cooling controller; a room whose mode was never observed still needs one.
+DEFAULT_HVAC_MODE = "cool"
+# How long the guard keeps re-asserting a restore before it gives up and says so.
+# Long enough for a cloud proxy to answer (a write is dropped often enough here that
+# one attempt is not a restore), short enough that it cannot argue for long with
+# somebody switching the unit off by hand while it is trying.
+RESTORE_TIMEOUT_MIN = 3.0
 
 # How long a merely-quiet sensor may hold the room before we stop trusting the
 # last reading altogether and park. Holding is right for a BLE gap; holding
@@ -71,6 +87,11 @@ STATE_OVERHEAT = "overheat"
 STATE_OVERCOOL = "overcool"
 STATE_STALE = "stale"
 STATE_FAILSAFE = "failsafe"
+# Power is back on but the unit has not started yet. A separate state because the
+# room is not the controller's again until the unit is actually running, and because
+# handing back to a controller that is forbidden to power the AC on means nothing
+# will ever finish the job — which is exactly what happened on 08-07 10:48.
+STATE_RESTORING = "restoring"
 
 
 def rails(target: float, band_low: float, band_high: float,
@@ -123,6 +144,9 @@ class SafetyGuard:
         # must hold until the room is genuinely back in the band, or it releases
         # into the same stall it just interrupted and trips again a minute later.
         self._tripped_stuck_cold = False
+        # The running mode the unit was in when this guard cut its power, so the
+        # restore puts back the owner's mode rather than one this code chose.
+        self._mode_before_cut: str | None = None
 
     def _enter(self, state: str, now: datetime) -> None:
         if state != self.state:
@@ -133,6 +157,21 @@ class SafetyGuard:
         if self._since is None:
             return 1e9
         return (now - self._since).total_seconds() / 60.0
+
+    def _restore_cmd(self, p: ZoneParams, why: str) -> Command:
+        """Put the unit back the way it was: power, mode, and a safe setpoint.
+
+        All three, every time, and repeated until the unit agrees. The switch usually
+        starts it on its own; the mode covers the case where it comes back in standby;
+        the setpoint keeps it from resuming the cold setting that caused the trip.
+        """
+        return Command(
+            mode=MODE_SAFETY_OVERCOOL,
+            reason=why,
+            set_ac_power=True,
+            set_hvac_mode=self._mode_before_cut or DEFAULT_HVAC_MODE,
+            set_setpoint=p.setpoint_max,
+        )
 
     def _in_overcool_cooldown(self, now: datetime, cooldown_min: float) -> bool:
         """Did we hand back from an overcool trip very recently?"""
@@ -164,6 +203,7 @@ class SafetyGuard:
 
         # --- truly gone: no value at all → park safely ---------------------
         if s.comfort is None:
+            cut_power = self.state == STATE_OVERCOOL
             self._enter(STATE_FAILSAFE, now)
             # A SETPOINT, not a room temperature. floor(target − band_low) is a
             # room figure; what setpoint holds the room there depends on the load,
@@ -174,14 +214,22 @@ class SafetyGuard:
             park = max(p.setpoint_min, min(p.setpoint_max, FAILSAFE_SETPOINT))
             return Command(
                 mode=MODE_FAILSAFE,
-                reason=f"sensor unavailable → park AC at floor(target−band_low)={park}, fan off",
+                reason=(f"sensor unavailable → park AC at {park}, fan off"
+                        + (", power back on (this guard cut it)" if cut_power else "")),
                 set_setpoint=park,
-                set_ac_power=None,   # leave power as-is; just fix the setpoint
+                # Power is left as it was — with one exception. An overcool trip cuts
+                # it, and a guard that cannot see the room can never put it back, so
+                # a thermometer that dies just after a cold trip would leave the AC
+                # off indefinitely with nothing watching. That is the one failure
+                # this hardware actually has, and it is the worst way to fail.
+                set_ac_power=True if cut_power else None,
+                set_hvac_mode=(self._mode_before_cut or DEFAULT_HVAC_MODE) if cut_power else None,
                 set_fan=False,
             )
 
         # --- has a value but stale: freeze, change nothing -----------------
         if stale:
+            overriding = self.state if self.state in (STATE_OVERHEAT, STATE_OVERCOOL) else None
             self._enter(STATE_STALE, now)
             held = self._mins_in_state(now)
             # The RAILS STILL APPLY. The reading is old, not wrong, and a room
@@ -194,8 +242,29 @@ class SafetyGuard:
             if s.comfort < sp.hard_min:
                 self._enter(STATE_OVERCOOL, now)
                 return self._overcool_cmd(s, s.comfort, sp, 0.0)
+            park = max(p.setpoint_min, min(p.setpoint_max, FAILSAFE_SETPOINT))
+            # An override in force is RELEASED on the way into a hold, never held.
+            # "Hold" means actuate nothing, so whatever the guard last wrote stayed
+            # latched on the hardware with nothing able to revise it: an overheat
+            # blast kept blasting, and an overcool trip left the AC off for as long
+            # as the sensor stayed quiet — a dead thermometer battery after a cold
+            # trip, which is this system's commonest hardware failure meeting its
+            # most dangerous state. The rails above still had their say first.
+            if overriding is not None:
+                self._below_band_since = None
+                self._tripped_stuck_cold = False
+                self._overcool_released_at = now
+                return Command(
+                    mode=MODE_STALE_HOLD,
+                    reason=(f"no fresh reading (last {s.comfort:.2f}) and it is inside "
+                            f"the rails → releasing the {overriding} override, "
+                            f"parking at {park}, fan off"),
+                    set_setpoint=park,
+                    set_ac_power=True if overriding == STATE_OVERCOOL else None,
+                    set_hvac_mode=(self._mode_before_cut or DEFAULT_HVAC_MODE)
+                    if overriding == STATE_OVERCOOL else None,
+                    set_fan=False)
             if held >= STALE_PARK_AFTER_MIN:
-                park = max(p.setpoint_min, min(p.setpoint_max, FAILSAFE_SETPOINT))
                 return Command(
                     mode=MODE_STALE_HOLD,
                     reason=(f"no fresh reading for {held:.0f} min (last {s.comfort:.2f}) "
@@ -226,27 +295,52 @@ class SafetyGuard:
             # the one time gate: we cut the power, so don't restart the
             # compressor seconds later (and don't flap on sensor noise).
             if y >= release_at and off_for >= MIN_OFF_MIN:
-                self._enter(STATE_NORMAL, now)
                 self._overcool_released_at = now
                 # Start the sustained-cold clock afresh, or the trip that just
                 # ended is still on the books and re-fires on the next tick.
                 self._below_band_since = None
                 self._tripped_stuck_cold = False
-                # Hand back with the AC powered on AND with a setpoint that cannot
-                # resume the overcool. Restoring power alone put the unit back on
-                # the cold setpoint it was holding when power was cut, and the
-                # compressor dwell then blocked the correction for up to six
-                # minutes — the guard handing the room straight back to what it
-                # had just rescued it from. The hot side has always carried a
-                # setpoint on release; the cold side did not.
-                if not s.ac_on and opt_cmd.set_ac_power is None:
-                    opt_cmd.set_ac_power = True
+                # Hand back with the unit RUNNING AGAIN and with a setpoint that
+                # cannot resume the overcool. Restoring power alone put the unit back
+                # on the cold setpoint it was holding when power was cut, and the
+                # compressor dwell then blocked the correction for up to six minutes.
+                # Restoring power and setpoint alone left it powered but in STANDBY,
+                # and a controller that may not switch an AC on cannot finish that —
+                # so the guard is not released until the unit reports it is running.
+                if not s.ac_on:
+                    self._enter(STATE_RESTORING, now)
+                    return self._restore_cmd(
+                        p, f"OVERCOOL guard: comfort {y:.2f} back above "
+                           f"{release_at:.1f} → restoring the unit")
+                self._enter(STATE_NORMAL, now)
                 if opt_cmd.set_setpoint is None:
                     opt_cmd.set_setpoint = p.setpoint_max
             else:
                 return self._overcool_cmd(s, y, sp, off_for,
                                           stuck_cold=self._tripped_stuck_cold,
                                           band_floor=p.target - p.band_low)
+        elif self.state == STATE_RESTORING:
+            if s.ac_on:
+                self._enter(STATE_NORMAL, now)   # it is running — the room is theirs
+            elif self._mins_in_state(now) < RESTORE_TIMEOUT_MIN:
+                # Re-assert rather than assume. A single write to this unit is dropped
+                # often enough that one attempt is not a restore.
+                return self._restore_cmd(
+                    p, f"OVERCOOL guard: the unit has not started yet "
+                       f"({self._mins_in_state(now):.1f} min) → asserting power, "
+                       f"mode and setpoint again")
+            else:
+                # Give up rather than argue indefinitely with a person who may be
+                # switching it off deliberately. The room is left with a unit that
+                # is off and a log row saying so, which is the honest outcome — and
+                # the rails still watch it.
+                self._enter(STATE_NORMAL, now)
+                return Command(
+                    mode=MODE_SAFETY_OVERCOOL,
+                    branch="safety.restore_failed",
+                    reason=(f"OVERCOOL guard: gave up restoring the unit after "
+                            f"{RESTORE_TIMEOUT_MIN:.0f} min — it still reports off. "
+                            f"The room is at {y:.2f} and NOTHING is regulating it"))
         elif self.state in (STATE_FAILSAFE, STATE_STALE):
             self._enter(STATE_NORMAL, now)  # sensor came back / reports again
 
@@ -280,6 +374,10 @@ class SafetyGuard:
             floor -= RETRIP_MARGIN
         if y < floor or stuck_cold:
             self._tripped_stuck_cold = stuck_cold and y >= floor
+            # Remember what the unit was running before we take its power away, so
+            # the restore puts the owner's mode back rather than one we picked.
+            if s.ac_on and s.hvac_mode:
+                self._mode_before_cut = s.hvac_mode
             self._enter(STATE_OVERCOOL, now)
             return self._overcool_cmd(s, y, sp, 0.0, stuck_cold=stuck_cold,
                                       band_floor=band_floor)
@@ -306,6 +404,11 @@ class SafetyGuard:
             mode=MODE_SAFETY_OVERHEAT,
             reason=reason,
             set_ac_power=True,
+            # …and the running mode with it, re-asserted every tick like the rest of
+            # this command. A unit left in standby at the hot rail is the worst
+            # outcome available: it looks like a full-cool blast in every log and does
+            # nothing to the room.
+            set_hvac_mode=s.hvac_mode or self._mode_before_cut or DEFAULT_HVAC_MODE,
             set_setpoint=blast,
             set_blower_idx=top_blower,
             set_fan=True if guard_fan > 0 else None,

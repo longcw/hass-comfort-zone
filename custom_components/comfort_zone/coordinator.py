@@ -58,7 +58,17 @@ from .const import (
 from .controller import Command, Controller, Signals, ZoneParams
 from .model import FopdtPredictor, ModelParams, recent_power_change
 from .options import MODE_KEYS, resolve
-from .safety import FAILSAFE_SETPOINT, SafetyGuard, SafetyParams, rails, warn_if_inside_band
+from .safety import (
+    DEFAULT_HVAC_MODE,
+    FAILSAFE_SETPOINT,
+    STATE_NORMAL,
+    STATE_OVERCOOL,
+    STATE_RESTORING,
+    SafetyGuard,
+    SafetyParams,
+    rails,
+    warn_if_inside_band,
+)
 from .store import ZoneStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -86,14 +96,29 @@ DRIFT_LOG_INTERVAL_MIN = 2.0
 # the guard's blast, but small enough that a garbage reading cannot poison the
 # dead-time model for the next hour.
 MAX_CREDIBLE_SP_STEP = 5
+# How stale a saved load bias may be before the loop is better off without it, and how
+# often it is written. The integral moves every tick and the store is a JSON file, so
+# it is checkpointed on a slow cadence rather than continuously — losing the last few
+# minutes of it costs nothing, and losing all of it is what this exists to prevent.
+INTEGRAL_MAX_AGE_MIN = 120.0
+INTEGRAL_SAVE_EVERY_MIN = 5.0
+INTEGRAL_SAVE_DELTA = 0.02
+# …but a move this large is written at once, whatever the cadence says. A young process
+# has nothing worth keeping on the slow clock yet, so two restarts inside five minutes
+# would lose the bias exactly when it is being rebuilt — which is the situation this
+# whole mechanism exists for.
+INTEGRAL_SAVE_JUMP = 0.15
 # Of the decision trace, what is worth persisting on every log row: enough to
 # re-judge the decision later without replaying the whole tick.
 LOG_TRACE_KEYS = ("y", "settled", "target", "error", "urgency", "power_bias", "u_ff", "u_fb", "u", "u_raw",
                   "integral", "saturated", "frozen", "sp", "trim", "blower",
                   "hi", "lo", "outdoor", "sp_dwell_left", "sp_observed",
-                  # the zone, and whether the room was inside it — without these a
+                  # the zone, and whether the ROOM was inside it — without these a
                   # row of "error 0, no action" cannot be told from a stalled loop
-                  "zone_lo", "zone_hi", "in_zone")
+                  "zone_lo", "zone_hi", "in_zone",
+                  # and whether the reading was overruling the model, which is the
+                  # difference between a demand the loop chose and one it was held to
+                  "cold_veto")
 
 
 def _slim_trace(trace: dict) -> dict:
@@ -155,6 +180,8 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         self._last_hold_log_at = None
         self._last_drift_log_at = None
         self._last_rail_warning: str | None = None
+        self._integral_saved_at = None
+        self._integral_saved: float | None = None
 
     # -- lifecycle ----------------------------------------------------------
     async def async_prepare(self) -> None:
@@ -172,6 +199,13 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
     def reload_model(self) -> None:
         self._predictor = FopdtPredictor(ModelParams.from_dict(self.store.model))
         self._controller = Controller(self._predictor)
+        # Put back the load bias the loop had earned, so a restart is not a reset of
+        # everything the loop knows about this room — see ZoneStore.integral.
+        stored = self.store.integral(INTEGRAL_MAX_AGE_MIN)
+        if stored is not None:
+            self._controller.pi.restore(stored)
+            _LOGGER.info("%s: resumed the loop's load bias at %+.2f °C of setpoint",
+                         self.zone_name, stored)
 
     async def async_set_enabled(self, value: bool) -> None:
         """Switching off means stop deciding — it must not mean freeze an override.
@@ -183,8 +217,15 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         AC stays off. Neither is what a person means by "off". So an override in
         force is released once, on the way out.
         """
-        if not value and self._safety.state != "normal":
+        if not value and self._safety.state != STATE_NORMAL:
             releasing = self._safety.state
+            # Power the overcool guard cut has to come back with the release, or
+            # "released" still means "AC off" — the exact thing the docstring above
+            # says is not what a person means by off. And with the running mode, or
+            # it comes back in standby. Only power this guard cut: the controller
+            # never touches AC power, so an off unit in any other state is somebody
+            # else's decision.
+            restore_power = releasing in (STATE_OVERCOOL, STATE_RESTORING)
             self._safety = SafetyGuard()
             try:
                 d = self.entry.data
@@ -194,9 +235,13 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
                     fan=d.get(CONF_FAN),
                     fan_speed_number=d.get(CONF_FAN_SPEED_NUMBER),
                     blower_levels=self.blower_levels(),
-                ), Command(set_setpoint=FAILSAFE_SETPOINT, set_fan=False))
+                ), Command(set_setpoint=FAILSAFE_SETPOINT, set_fan=False,
+                           set_ac_power=True if restore_power else None,
+                           set_hvac_mode=DEFAULT_HVAC_MODE if restore_power else None))
                 _LOGGER.info("%s: disabled during %s — released the override to "
-                             "setpoint %s", self.zone_name, releasing, FAILSAFE_SETPOINT)
+                             "setpoint %s%s", self.zone_name, releasing,
+                             FAILSAFE_SETPOINT,
+                             ", power restored" if restore_power else "")
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error("%s: could not release the %s override on disable: %s",
                               self.zone_name, releasing, err)
@@ -433,9 +478,11 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         signals = Signals(
             now=now, comfort=comfort, slope=slope,
             outdoor=self._outdoor(), forecast=await self._async_forecast(now),
-            power=power, ac_on=ac_on, setpoint=setpoint, blower_idx=blower_idx,
+            power=power, ac_on=ac_on,
+            hvac_mode=climate_st.state if ac_on and climate_st else None,
+            setpoint=setpoint, blower_idx=blower_idx,
             fan_on=fan_on, fan_level=fan_level,
-            guard_active=self._safety.state != "normal",
+            guard_active=self._safety.state != STATE_NORMAL,
         )
         predicted = self._predictor.predict_settled(now, comfort) if comfort is not None else None
 
@@ -479,6 +526,11 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             cmd.trace = dict(opt_cmd.trace)
             cmd.trace["overridden"] = opt_cmd.branch or None
             cmd.branch = cmd.branch or f"safety.{self._safety.state}"
+        # A room with nothing regulating it is not an INFO-level event. This is the
+        # one state where neither layer can act: the guard cut power, could not get
+        # the unit started again, and the controller is forbidden to try.
+        if cmd.branch == "safety.restore_failed":
+            _LOGGER.error("%s: %s", self.zone_name, cmd.reason)
 
         bindings = Bindings(
             ac_climate=d[CONF_AC_CLIMATE],
@@ -490,10 +542,9 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
         actions: list[str] = []
         try:
             actions = await apply(self.hass, bindings, cmd)
-            # Start the compressor and blower dwells only for commands that were
-            # actually issued — see SplitRange.commit.
-            self._controller.split.commit(
-                now, cmd.set_setpoint is not None, cmd.set_blower_idx is not None)
+            # Only the blower's dwell starts here. The compressor's starts when the
+            # UNIT reports a new setpoint, above — see SplitRange.note_setpoint_change.
+            self._controller.split.commit(now, cmd.set_blower_idx is not None)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("%s: failed to apply command: %s", self.zone_name, err)
 
@@ -541,9 +592,24 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             _LOGGER.info("%s: %s — %s", self.zone_name, cmd.reason,
                          ", ".join(actions) or "no action")
 
+        await self._checkpoint_integral(now)
         return self._snapshot(opts, params, signals, target, predicted, cmd.mode, cmd.reason,
                               is_night, actions, dev,
                               branch=cmd.branch, trace=cmd.trace)
+
+    async def _checkpoint_integral(self, now) -> None:
+        """Save the loop's load bias occasionally, so a restart does not lose it."""
+        value = self._controller.pi.integral
+        moved = (abs(value - self._integral_saved)
+                 if self._integral_saved is not None else None)
+        if moved is not None and moved < INTEGRAL_SAVE_DELTA:
+            return
+        if (moved is None or moved < INTEGRAL_SAVE_JUMP) \
+                and self._integral_saved_at is not None \
+                and now - self._integral_saved_at < timedelta(minutes=INTEGRAL_SAVE_EVERY_MIN):
+            return
+        self._integral_saved, self._integral_saved_at = value, now
+        await self.store.set_integral(value, now.isoformat())
 
     def _snapshot(self, opts, params, signals, target, predicted, mode, reason, is_night, actions, dev,
                   *, branch="", trace=None):
@@ -560,7 +626,6 @@ class ComfortZoneCoordinator(DataUpdateCoordinator):
             "predicted": predicted,
             "band_low": params.band_low,
             "band_high": params.band_high,
-            # The rails actually in force, which are pushed out when a configured one
             # The configured rails, enforced exactly as set.
             "hard_min": params.hard_min,
             "hard_max": params.hard_max,

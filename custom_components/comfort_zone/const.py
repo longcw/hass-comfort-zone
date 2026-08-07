@@ -76,7 +76,6 @@ OPT_NIGHT_END: Final = "night_end"
 # Safety (always-on guard).
 OPT_HARD_MIN: Final = "hard_min"                   # absolute comfort_temp floor, °C
 OPT_HARD_MAX: Final = "hard_max"                   # absolute comfort_temp ceiling, °C
-OPT_SAFETY_MARGIN: Final = "safety_margin"         # wide margin beyond band for guard, °C
 OPT_SAFETY_COOLDOWN_MIN: Final = "safety_cooldown_min"
 
 # ---------------------------------------------------------------------------
@@ -84,7 +83,6 @@ OPT_SAFETY_COOLDOWN_MIN: Final = "safety_cooldown_min"
 # There is no online learning: it was not required, was not observed to help, and
 # its one measurable effect was a positive feedback loop through a learned dead time.
 # ---------------------------------------------------------------------------
-OPT_MODEL: Final = "model"                         # dict, see MODEL_DEFAULTS
 MK_DEAD_TIME: Final = "dead_time_min"              # θ: command -> comfort starts moving
 MK_TAU: Final = "tau_min"                          # τ: first-order time constant
 MK_GAIN: Final = "gain_per_step"                   # K: °C settled change per 1°C setpoint
@@ -163,7 +161,6 @@ STRATEGY_PRESETS: Final = {
         OPT_FAN_MAX_NIGHT: 25,
         OPT_BLOWER_MAX_DAY: 1,
         OPT_BLOWER_MAX_NIGHT: 1,
-        OPT_SAFETY_MARGIN: 1.4,
         OPT_SAFETY_COOLDOWN_MIN: 12,
     },
     STRATEGY_ECO: {
@@ -174,7 +171,6 @@ STRATEGY_PRESETS: Final = {
         OPT_FAN_MAX_NIGHT: 40,
         OPT_BLOWER_MAX_DAY: 1,
         OPT_BLOWER_MAX_NIGHT: 1,
-        OPT_SAFETY_MARGIN: 1.6,
         OPT_SAFETY_COOLDOWN_MIN: 15,
     },
     STRATEGY_COMFORT: {
@@ -185,7 +181,6 @@ STRATEGY_PRESETS: Final = {
         OPT_FAN_MAX_NIGHT: 35,
         OPT_BLOWER_MAX_DAY: 1,
         OPT_BLOWER_MAX_NIGHT: 1,
-        OPT_SAFETY_MARGIN: 1.3,
         OPT_SAFETY_COOLDOWN_MIN: 10,
     },
     # custom: no preset, user-tuned values are kept as-is.
@@ -210,7 +205,6 @@ OPTION_DEFAULTS: Final = {
     OPT_NIGHT_END: "07:00",
     OPT_HARD_MIN: 23.0,
     OPT_HARD_MAX: 29.0,
-    OPT_SAFETY_MARGIN: 1.4,
     OPT_SAFETY_COOLDOWN_MIN: 12,
 }
 
@@ -223,7 +217,6 @@ MODE_IDLE: Final = "idle"
 MODE_COOLING: Final = "cooling"
 MODE_EASING: Final = "easing"
 MODE_FAN_ASSIST: Final = "fan_assist"
-MODE_MANAGED_OFF: Final = "managed_off"
 MODE_SAFETY_OVERHEAT: Final = "safety_overheat"
 MODE_SAFETY_OVERCOOL: Final = "safety_overcool"
 MODE_STALE_HOLD: Final = "stale_hold"

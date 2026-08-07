@@ -261,7 +261,7 @@ def test_setpoint_is_paced_by_the_compressor_dwell():
     s, p = SplitRange(), params()
     first = s.resolve(25.0, T0, 26, 0, p)
     check(first.setpoint == 25, "the first move should take")
-    s.commit(T0, True, False)                    # the caller applied it
+    s.note_setpoint_change(T0)                   # the unit reported the new value
     soon = s.resolve(24.0, T0 + timedelta(minutes=2), 25, 0, p)
     check(soon.setpoint == 25 and soon.sp_blocked_by_dwell,
           f"a second move 2 min later must be blocked, got {soon.setpoint}")
@@ -277,6 +277,30 @@ def test_the_dwell_is_not_burned_by_a_move_that_was_never_issued():
     out = s.resolve(24.0, T0 + timedelta(seconds=45 * 8), 26, 0, p)
     check(not out.sp_blocked_by_dwell and out.setpoint == 24,
           "with nothing ever issued the dwell must still be free")
+
+
+def test_a_write_the_unit_never_took_does_not_spend_the_dwell():
+    """Live 08-07 07:58: a lost write cost six blind minutes and 0.26 °C.
+
+    The cloud proxy ACKs ``set_temperature`` and keeps reporting its remembered
+    value. Absolute output is meant to make that self-correcting — "write it if it
+    differs from what the unit reports" — but only if the dwell agrees the
+    compressor never moved.
+    """
+    s, p = SplitRange(), params()
+    t = T0
+    asked = s.resolve(25.0, t, 24, 0, p)
+    check(asked.setpoint == 25, "the loop must ask for 25")
+    # four ticks in which the unit keeps saying 24, exactly as measured
+    for i in range(1, 5):
+        again = s.resolve(25.0, T0 + timedelta(seconds=45 * i), 24, 0, p)
+        check(again.setpoint == 25 and not again.sp_blocked_by_dwell,
+              f"tick {i}: a lost write must be re-asserted, not paced "
+              f"(got {again.setpoint}, blocked={again.sp_blocked_by_dwell})")
+    # and once it really takes, the pacing starts and holds
+    s.note_setpoint_change(T0 + timedelta(seconds=45 * 5))
+    paced = s.resolve(26.0, T0 + timedelta(seconds=45 * 6), 25, 0, p)
+    check(paced.sp_blocked_by_dwell, "the unit's own change must start the dwell")
 
 
 def test_split_range_mid_ranges_the_blower_when_its_gain_is_known():
@@ -391,6 +415,25 @@ def test_at_the_limit_and_outside_the_zone_reads_as_failing():
     check("cannot keep up" in out.reason, f"and must say so: {out.reason}")
 
 
+def test_a_pinned_limit_is_named_by_its_own_value_not_the_setpoint_held():
+    """Live 11:11 read "at the setpoint floor (27)" — the floor was 24."""
+    c, p = fresh(), params()
+    # drive the demand hard onto the floor, then let the unit report 27 with a fresh
+    # dwell: the demand is at 24 and the setpoint being held is 27
+    floored, _ = run(c, p, 40, comfort=29.0, outdoor=33.0, setpoint=24)
+    check(floored.trace["at_limit"] == "floor", "setup: the demand must be floored")
+    t = T0 + timedelta(minutes=41)
+    c.note_setpoint_change(t)
+    out = c.tick(sig(t=t + TICK, comfort=29.0, outdoor=33.0, setpoint=27), p)
+    d = out.trace
+    check(d["at_limit"] == "floor" and d["sp"] == 27,
+          f"the setup needs a floored demand held at 27, got {d['at_limit']}/{d['sp']}")
+    check(f"({p.setpoint_min})" in out.reason,
+          f"the limit must be named by its own value: {out.reason}")
+    check("pacing the compressor" in out.reason,
+          f"and the reason the unit is elsewhere must be said: {out.reason}")
+
+
 def test_a_loop_with_headroom_is_not_reported_as_pinned():
     c, p = fresh(), params()
     out, _ = run(c, p, 20, comfort=26.0, outdoor=26.0)
@@ -463,15 +506,19 @@ def test_leaving_the_zone_produces_an_error_worth_acting_on():
     c = fresh()
     lo, hi = c.zone(params(band_low=0.4, band_high=0.7))
     mid = (lo + hi) / 2
-    check(c.zone_error(mid, lo, hi) == 0.0, "inside the zone is no error")
-    check(c.zone_error(lo, lo, hi) == 0.0 and c.zone_error(hi, lo, hi) == 0.0,
+
+    def err(settled, y=None):
+        return c.zone_error(settled, y if y is not None else settled, lo, hi)
+
+    check(err(mid) == 0.0, "inside the zone is no error")
+    check(err(lo) == 0.0 and err(hi) == 0.0,
           "the edges themselves are still comfortable")
-    just_out = c.zone_error(lo - 0.01, lo, hi)
+    just_out = err(lo - 0.01)
     check(just_out > (hi - lo) / 2,
           f"a hair below the zone must already ask for real correction, got {just_out:.3f}")
-    check(c.zone_error(hi + 0.01, lo, hi) < -(hi - lo) / 2,
+    check(err(hi + 0.01) < -(hi - lo) / 2,
           "and the warm side must be symmetric in sign")
-    check(abs(c.zone_error(lo - 0.3, lo, hi) - (mid - (lo - 0.3))) < 1e-9,
+    check(abs(err(lo - 0.3) - (mid - (lo - 0.3))) < 1e-9,
           "outside, the error is the distance to the centre")
 
 
@@ -608,19 +655,134 @@ def test_a_room_falling_below_its_zone_gets_a_prompt_setpoint_rise():
 
 
 def test_the_threshold_collapses_once_the_room_leaves_the_zone():
+    """And collapses AT ONCE. The ramp only ever produced the worst of both."""
     m = model()
     s = SplitRange(m)
-    floor = (1.0 + m.kc * m.gain_per_step) / 2.0
     calm = s.sp_threshold(0.0)
     check(calm > 0.7, f"inside the zone it must still resist ripple, got {calm:.2f}")
-    check(s.sp_threshold(0.15) < calm, "it must relax as the room leaves")
-    # mildly out (fully collapsed, but still less than one step's worth of room):
-    # the anti-hunt floor binds, because a step could land no closer than it started
-    mild = s.sp_threshold(m.gain_per_step * 0.9)
-    check(abs(mild - floor) < 1e-9, f"mildly out must hold the floor, got {mild:.3f}")
-    # far out: one step is unambiguously right, so the floor's argument lapses
-    far = s.sp_threshold(m.gain_per_step * 2)
-    check(abs(far - 0.5) < 1e-9, f"far out must reach the bare half-step, got {far:.3f}")
+    # Live 08-07 07:49, a room 0.115 °C out got 0.06 of relaxation and waited eight
+    # and a half minutes. A hair out and half a degree out both reach the half-step:
+    # once there is something to fix, patience is the failure, not the virtue.
+    for urgency in (0.02, 0.115, 0.3, m.gain_per_step * 2):
+        got = s.sp_threshold(urgency)
+        check(abs(got - 0.5) < 1e-9,
+              f"{urgency:.3f} out of zone must be the bare half-step, got {got:.3f}")
+
+
+# --- the 2026-08-07 afternoon stall ----------------------------------------
+# Room 0.42 °C below its zone and still falling, reported as "idle — settles 25.96,
+# inside [25.88, 26.42]", holding a setpoint of 25. The meter had been flat at ~1 kW
+# across the 24→25 step that the model was crediting with +0.5 °C, so nothing was on
+# the way at all.
+def test_the_loop_resumes_its_load_bias_after_a_restart():
+    """A restart used to hand the loop its feedforward's opinion of the load.
+
+    The integral carries the whole difference between the reset curve and this room's
+    real load — measured 0.5–0.8 °C of setpoint. Live 08-07, three restarts each zeroed
+    it, and the room walked toward its cold rail while it was re-earned; the third
+    ended in a guard trip. Nothing else in the loop survives a restart, and nothing
+    else needs to.
+    """
+    c, p = fresh(), params(band_low=0.4, band_high=0.7)
+    earned, _ = run(c, p, 45, comfort=25.5, outdoor=32.2, setpoint=25)
+    bias = c.pi.integral
+    check(bias > 0.3, f"setup: the loop must have earned a real bias, got {bias:.2f}")
+
+    cold = fresh()                                   # what a restart used to give us
+    a = cold.tick(sig(comfort=25.5, outdoor=32.2, setpoint=25), p)
+    warm = fresh()
+    warm.pi.restore(bias)
+    b = warm.tick(sig(comfort=25.5, outdoor=32.2, setpoint=25), p)
+    check(b.trace["u_raw"] > a.trace["u_raw"] + 0.3,
+          f"a resumed loop must not start displaced: cold start asks "
+          f"{a.trace['u_raw']:.2f}, resumed asks {b.trace['u_raw']:.2f}")
+    check(abs(b.trace["u_raw"] - run(c, p, 0, comfort=25.5, outdoor=32.2,
+                                     setpoint=25)[0].trace["u_raw"]) < 0.1,
+          "and must pick up where the loop left off")
+
+
+def test_the_model_may_not_talk_the_loop_out_of_a_cold_room():
+    c, p = fresh(), params(band_low=0.4, band_high=0.7)
+    lo, hi = c.zone(p)
+    y = 25.46
+    c.predictor.record_setpoint_change(T0, +1.0)      # 6 min ago, still inside θ
+    cmd = c.tick(sig(t=T0 + timedelta(minutes=6), comfort=y, outdoor=32.2,
+                     setpoint=25), p)
+    check(lo <= cmd.trace["settled"] <= hi,
+          f"the predictor must still believe the room settles in zone, "
+          f"got {cmd.trace['settled']:.2f}")
+    check(abs(cmd.trace["error"] - ((lo + hi) / 2 - y)) < 1e-9,
+          f"but the error must be what the thermometer says ({(lo + hi) / 2 - y:.2f}), "
+          f"got {cmd.trace['error']:.2f}")
+    check(cmd.mode == const.MODE_EASING, f"a room below its zone is not idle, {cmd.mode}")
+    check(cmd.branch != "pi.in_zone", f"nor in zone, got {cmd.branch}")
+    check(cmd.trace["in_zone"] is False, "in_zone is about the room, not the prediction")
+
+
+def test_a_warm_room_still_lets_the_model_shrink_the_error():
+    """The floor is COLD-SIDE ONLY. On the warm side it would be v1–v4's stacking."""
+    c, p = fresh(), params(band_low=0.4, band_high=0.7)
+    c.predictor.record_setpoint_change(T0, -1.0)
+    cmd = c.tick(sig(t=T0 + timedelta(minutes=1), comfort=26.9, outdoor=32.2,
+                     setpoint=24), p)
+    check(cmd.trace["error"] == 0.0,
+          f"cooling in flight must still answer a warm room, got {cmd.trace['error']:.2f}")
+
+
+def test_a_room_outside_its_zone_is_never_reported_as_in_zone():
+    """Waiting on a command in flight is a third state, not the comfortable one."""
+    c, p = fresh(), params(band_low=0.4, band_high=0.7)
+    # mild outdoor on purpose: at the setpoint floor the more informative branch is
+    # pi.at_floor, which has its own test
+    c.predictor.record_setpoint_change(T0, -1.0)
+    cmd = c.tick(sig(t=T0 + timedelta(minutes=1), comfort=26.9), p)
+    check(cmd.branch == "pi.waiting", f"expected pi.waiting, got {cmd.branch}")
+    check(cmd.trace["in_zone"] is False and cmd.trace["settled_in_zone"] is True,
+          "the room is out and the prediction is in — both must be visible")
+    check(cmd.mode == const.MODE_COOLING, f"and it is cooling, not idle, got {cmd.mode}")
+
+
+def test_the_cold_veto_is_a_limit_the_integrator_can_see():
+    """Applied after the fact, back-calculation unwound nothing and it wound up."""
+    c, p = fresh(), params(band_low=0.4, band_high=0.7)
+    # A room below its zone with the unit already at 27: nothing colder may be
+    # commanded, while the reset curve at 32 °C outdoor asks for ~24.
+    held, _ = run(c, p, 45, comfort=25.3, outdoor=32.2, setpoint=27)
+    check(held.trace["cold_veto"] or held.trace["u_raw"] >= 26.9,
+          f"the veto must bind or the demand must have reached it, "
+          f"u_raw {held.trace['u_raw']:.2f}")
+    check(held.trace["u"] >= 27 - 1e-6,
+          f"and the command may never be colder than the unit already holds, "
+          f"got {held.trace['u']:.2f}")
+    # back-calculation parks the demand AT the boundary instead of travelling past
+    # it, so the integral cannot hand the room a wound-up demand when it lifts
+    check(held.trace["u_raw"] <= 27 + 0.6,
+          f"the demand ran {held.trace['u_raw'] - 27:.2f} past the floor it was "
+          f"held to — that is windup")
+    check(held.trace["blower"] == 0 and not held.set_fan,
+          "a vetoed cold room must not get more airflow either")
+
+
+def test_the_fine_actuators_read_the_setpoint_in_force():
+    """Not the one just chosen: an unarrived setpoint delivers nothing."""
+    p = params(blower_gain=0.0)
+    # the loop wants 24.75 while the unit still runs 24 — it is stuck COLDER than it
+    # wants, so the fine actuators must back off even as the setpoint rises
+    out = SplitRange().resolve(24.75, T0, 24, 1, p, urgency=0.2)
+    check(out.setpoint == 25, f"the coarse actuator asks for 25, got {out.setpoint}")
+    check(out.trim < 0, f"the residual in force is negative, got {out.trim:.2f}")
+    check(out.blower_idx == 0,
+          f"asking for a warmer setpoint and more airflow at once is the 07:58 bug, "
+          f"got blower {out.blower_idx}")
+    check(not out.fan_on, "and a room being eased must not get the fan")
+
+
+def test_an_off_ladder_blower_is_driven_back_onto_the_ladder():
+    """"自动" is in this unit's fan_modes and is not an intensity — it is not level 0."""
+    c, p = fresh(), params()
+    cmd = c.tick(sig(blower_idx=None), p)
+    check(cmd.set_blower_idx is not None,
+          "a blower reported off our ladder must be commanded, or it stays on auto")
 
 
 def test_the_controller_never_powers_the_ac_on_at_any_temperature():
@@ -658,6 +820,105 @@ def test_the_guard_restores_only_the_power_it_cut():
     out2 = g.evaluate(warm, p, sp, c.tick(warm, p))
     check(out2.set_ac_power is True,
           f"the guard must put back the power it cut, got {out2.set_ac_power}")
+
+
+def test_restoring_power_also_restores_the_running_mode():
+    """Live 08-07 10:48: the guard restored power and the unit stayed off.
+
+    A power-on issued with an immediate setpoint write left the unit reporting "off"
+    with the setpoint applied, and the controller — which may never switch an AC on —
+    said so for seven minutes until a person started it by hand. So the restore
+    asserts power AND mode AND setpoint, and the guard does not hand the room back
+    until the unit reports itself running.
+    """
+    c, p = fresh(), params()
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=27.5, cooldown_min=12)
+    # trip the cold rail while the unit is running in "cool"
+    cold = sig(comfort=25.0, ac_on=True)
+    cold.hvac_mode = "cool"
+    check(g.evaluate(cold, p, sp, c.tick(cold, p)).set_ac_power is False,
+          "the cold rail must cut power")
+    # the room recovers past the release, but the unit reports itself OFF
+    back = sig(t=T0 + timedelta(minutes=20), comfort=26.0, ac_on=False)
+    out = g.evaluate(back, p, sp, c.tick(back, p))
+    check(out.set_ac_power is True, "the guard must put its own power back")
+    check(out.set_hvac_mode == "cool",
+          f"and the mode it took away, got {out.set_hvac_mode!r}")
+    check(out.set_setpoint is not None, "with a setpoint that cannot resume the trip")
+    # it must NOT consider itself released while the unit is still off, or nothing
+    # is left that is allowed to finish the job
+    check(g.state != "normal", f"the guard released into a dead unit, state={g.state}")
+    still = sig(t=T0 + timedelta(minutes=21), comfort=26.1, ac_on=False)
+    again = g.evaluate(still, p, sp, c.tick(still, p))
+    check(again.set_hvac_mode == "cool", "and re-asserts, because writes get dropped")
+    # once the unit reports running, the room goes back to the controller
+    live = sig(t=T0 + timedelta(minutes=22), comfort=26.1, ac_on=True)
+    live.hvac_mode = "cool"
+    handed = g.evaluate(live, p, sp, c.tick(live, p))
+    check(g.state == "normal", f"a running unit must end the restore, state={g.state}")
+    check(handed.set_ac_power is None, "and the guard must stop touching power")
+
+
+def test_the_guard_gives_up_restoring_rather_than_arguing_forever():
+    """Somebody switching it off by hand must win, and the log must say so."""
+    c, p = fresh(), params()
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=27.5, cooldown_min=12)
+    cold = sig(comfort=25.0)
+    cold.hvac_mode = "cool"
+    g.evaluate(cold, p, sp, c.tick(cold, p))
+    t = T0 + timedelta(minutes=20)
+    seen, last = [], None
+    for i in range(12):                       # 9 min of a unit that will not start
+        s_ = sig(t=t + timedelta(seconds=45 * i), comfort=26.0, ac_on=False)
+        last = g.evaluate(s_, p, sp, c.tick(s_, p))
+        seen.append(last)
+    gave_up = [x for x in seen if x.branch == "safety.restore_failed"]
+    check(len(gave_up) == 1, f"exactly one give-up row, got {len(gave_up)}")
+    check("NOTHING is regulating it" in gave_up[0].reason,
+          f"and it must be loud, got {gave_up[0].reason!r}")
+    check(g.state == "normal", f"it must stop trying, state={g.state}")
+    check(last.set_ac_power is None and last.set_hvac_mode is None,
+          "and stop commanding power once it has given up")
+
+
+def test_a_stale_reading_releases_an_override_instead_of_latching_it():
+    """A hold actuates nothing, so an override in force stays on the hardware.
+
+    An overcool trip cuts power and a stale hold cannot revise it, so a thermometer
+    that goes quiet just after a cold trip left the AC off for as long as it stayed
+    quiet — this system's commonest hardware failure meeting its worst state.
+    """
+    c, p = fresh(), params()
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=27.5, cooldown_min=12)
+    cold = sig(comfort=25.0)
+    check(g.evaluate(cold, p, sp, c.tick(cold, p)).set_ac_power is False,
+          "the cold rail must cut power first")
+    quiet = sig(t=T0 + timedelta(minutes=5), comfort=25.7, ac_on=False)
+    out = g.evaluate(quiet, p, sp, c.tick(quiet, p), stale=True)
+    check(out.set_ac_power is True,
+          f"a stale hold must give back the power the guard cut, got {out.set_ac_power}")
+    check(out.set_setpoint is not None, "and park at a safe setpoint, not the trip's")
+    # once, not every tick — after that it is an ordinary hold
+    later = sig(t=T0 + timedelta(minutes=6), comfort=25.7)
+    again = g.evaluate(later, p, sp, c.tick(later, p), stale=True)
+    check(again.set_ac_power is None, "the release happens once, not on every tick")
+
+
+def test_an_unavailable_sensor_gives_back_the_power_the_guard_cut():
+    """Same hole, reached through the other sensor failure."""
+    c, p = fresh(), params()
+    g = SafetyGuard()
+    sp = SafetyParams(hard_min=25.2, hard_max=27.5, cooldown_min=12)
+    cold = sig(comfort=25.0)
+    g.evaluate(cold, p, sp, c.tick(cold, p))
+    gone = sig(t=T0 + timedelta(minutes=3), comfort=None, ac_on=False)
+    out = g.evaluate(gone, p, sp, c.tick(gone, p))
+    check(out.set_ac_power is True,
+          f"a dead sensor after a cold trip must not leave the AC off, "
+          f"got {out.set_ac_power}")
 
 
 def test_power_says_nothing_until_it_has_a_baseline():
@@ -744,9 +1005,9 @@ def _guard_run(minutes, comfort, p, rails=(24.5, 27.8), t0=T0):
     while t <= t0 + timedelta(minutes=minutes):
         e = (t - t0).total_seconds() / 60.0
         y = comfort(e) if callable(comfort) else comfort
-        sig = sig_ = Signals(now=t, comfort=y, slope=0.0, outdoor=26.0, power=1200.0,
-                             ac_on=True, setpoint=sp, blower_idx=0, fan_on=False,
-                             guard_active=g.state != "normal")
+        sig_ = Signals(now=t, comfort=y, slope=0.0, outdoor=26.0, power=1200.0,
+                       ac_on=True, setpoint=sp, blower_idx=0, fan_on=False,
+                       guard_active=g.state != "normal")
         out = g.evaluate(sig_, p, sp_, c.tick(sig_, p))
         if g.state == "overcool" and was != "overcool":
             trips += 1

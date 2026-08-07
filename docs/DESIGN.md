@@ -149,6 +149,17 @@ PI, no derivative. The error is the **Smith-predictor error**, `target − settl
 not `target − comfort`: feeding back where the room will settle removes the dead
 time from the loop and lets a textbook tuning rule apply.
 
+**On the cold side the error may never be smaller than the reading says.** `settled`
+credits every in-flight step with a full `gain_per_step`, and that prior is
+deliberately high — safe where it divides into `Kc`, aggressive where it multiplies
+here (§8). Measured live 08-07 16:10: a 24→25 step drew the same 1 kW before and
+after, so nothing was on the way at all, yet the model had already shaved 0.24 °C off
+the error and the loop sat at 25 with the room 0.55 °C below its zone and still
+falling. So a prediction may shrink the error that answers a **warm** room — feeding
+back a reading that will not move for a dead time is how v1–v4 stacked commands into
+the lag — but it may never talk the loop out of warming a room the thermometer says
+is cold. Same rule as the veto below, one stage earlier, and cold side only.
+
 **Anti-windup by back-calculation**, against what the actuators can really deliver.
 The output saturates at the setpoint limits for hours on a hot afternoon; most of the
 v3/v4 overshoot looks in hindsight like an integrator nobody had written down and so
@@ -200,23 +211,31 @@ headroom both ways. `g = 0` (its current value — not identifiable, §8) collap
 to setpoint-plus-fan with no special case, and the blower then steps on the *sign* of
 the residual, since the direction is known even when the magnitude is not.
 
-**The setpoint threshold has a hard floor and a deliberate collapse.** Stepping by 1
-moves `settled` by `K`, which the loop answers with `Kc·K` *against* the step. So a
-step from distance `d` lands `(1−d) + Kc·K` from the new setpoint, and unless the
-threshold clears `(1 + Kc·K)/2 = 0.66` the step gains nothing and the loop hunts —
-measured live at 0.65: setpoint 24→25→24 in six minutes. But that argument only holds
-while a step is comparable to the error. Once the room is more than one step's worth
-of room temperature outside its zone, a full step is unambiguously right, so the
-threshold collapses to a bare half-step. Holding the floor there cost three minutes
-and 0.16 °C on the 08-07 trajectory.
+**The setpoint threshold has a hard floor inside the zone and none outside it.**
+Stepping by 1 moves `settled` by `K`, which the loop answers with `Kc·K` *against* the
+step. So a step from distance `d` lands `(1−d) + Kc·K` from the new setpoint, and
+unless the threshold clears `(1 + Kc·K)/2 = 0.66` the step gains nothing and the loop
+hunts — measured live at 0.65: setpoint 24→25→24 in six minutes. That answer only
+exists while the loop still has an error to feel, and a step that returns the room to
+its zone produces exactly **zero** error. So outside the zone the argument lapses
+entirely and the threshold is the bare half-step, at once — below half a step the
+nearest integer is by definition already the right one, so there is nothing left to
+argue about. Ramping it was measured worse than either endpoint (§9.6).
 
-Dwell clocks are stamped by the **caller, on commands actually issued** — not inside
-`resolve`. Stamping on intent burned the compressor pacing on moves that never
-happened during a guard override (§9.4).
+The **compressor dwell starts on the unit's own setpoint transition**, never on our
+write. This VRF's cloud proxy acknowledges `set_temperature` and then keeps reporting
+its remembered value; stamped on the write, a lost write spent the full six minutes
+pacing a compressor that had not moved (§9.7). Absolute output is what makes a lost
+write self-correcting — "write it if it differs from what the unit reports" — but only
+if the dwell agrees about what *moved* means. The blower's dwell does stamp on the
+write: no proxy in the way, no compressor behind it.
 
-The fine actuators are sized against `u_raw`, the demand **before** the clamp: at the
+The fine actuators are sized against `u_raw`, the demand **before** the clamp — at the
 floor the clamped demand says "exactly what was asked for" every tick, while the
-unclamped demand still says how far short the unit is falling.
+unclamped demand still says how far short the unit is falling — and against the
+setpoint the unit is **running**, not the one just chosen. Read off the chosen
+setpoint the residual flipped sign in the same tick as any step that crossed the
+demand, so one tick asked for a warmer setpoint and more airflow together (§9.7).
 
 ---
 
@@ -258,6 +277,21 @@ Four rules that are not negotiable:
    report as a stale *value*, not `unavailable` — switched every protection off
    indefinitely. After 30 min of staleness it parks at `FAILSAFE_SETPOINT` rather
    than holding forever.
+5. **An override in force is released on the way into a hold, never held.** "Hold"
+   actuates nothing, so whatever the guard last wrote stayed latched on hardware that
+   nothing could then revise: an overheat blast kept blasting, and an overcool trip
+   left the AC **off indefinitely** — a dead thermometer battery after a cold trip,
+   which is this system's commonest hardware failure meeting its most dangerous
+   state. Both sensor failures (stale, and gone entirely) now give back the power
+   this guard cut and park at a safe setpoint. The rails above still have their say
+   first, so a stale reading past a rail keeps the guard.
+6. **Restoring is a state, not a command.** The guard asserts power, the running mode
+   and a safe setpoint, and keeps asserting them every tick until the unit reports
+   itself running — only then is it released. One attempt is not a restore on this
+   proxy (§9.8), and because the controller may never switch an AC on, a guard that
+   hands back to a unit that never started leaves **nothing at all** regulating the
+   room. It gives up after `RESTORE_TIMEOUT_MIN` so it cannot argue indefinitely with
+   somebody switching the unit off by hand, and logs that at ERROR when it does.
 
 Guard behaviour:
 
@@ -284,16 +318,27 @@ guard and before `apply`, leaving the last command latched on the hardware — s
 against what actually ran on the same readings. At the owner's configuration
 (band 0.4/0.7, rails 25.2/27.5):
 
-| | recorded | new core |
-|---|---|---|
-| mean in band | 74.4% | **82.2%** |
-| mean rms error | 0.455 | **0.400** |
-| setpoint moves/h | 4.8 | **3.0** |
-| worst cold excursion | 0.64 | **0.50** |
+| | recorded | v5 as first shipped | v5 + §9.7 fixes |
+|---|---|---|---|
+| mean in band | 74.4% | 82.6% | **85.6%** |
+| mean rms error | 0.455 | 0.402 | **0.396** |
+| setpoint moves/h | 4.8 | 3.0 | **2.5** |
+| worst cold excursion | 0.64 | 0.50 | **0.36** |
+
+Five of the six windows improved on band fit; the sixth (the post-v4 window, the worst
+recorded at 49.2%) fell 68.5% → 63.5% with its worst cold excursion unchanged.
 
 At band 0.5/0.8 the same core reaches ~91% in band. The band is the knob: wider is
 calmer, and rms barely moves across the range, so the room is not drifting more — the
 loop is simply no longer fussing.
+
+**Both columns are measured with the compressor dwell paced.** Neither replay arm used
+to start that clock, so every moves/h the harness ever printed was one an unpaced loop
+could reach and the hardware could not. It happened not to matter for the code
+measured first, whose threshold rarely wanted a move inside six minutes anyway — which
+is exactly why the gap stayed hidden until the threshold collapsed. Unpaced, the same
+fixes below score 10.0 moves/h and read as a disaster. Judge nothing on this harness
+without checking that clock is running.
 
 The closed-loop arm of replay assumes the gain that could not be identified (§8), so
 treat absolute numbers as indicative and the recorded column as ground truth. The
@@ -329,8 +374,10 @@ So:
 **`K` is used in two places that want opposite errors, and only one was reasoned
 about.** It divides into `Kc` (guessing high → gentler loop) and it *multiplies* in
 `remaining_effect` (guessing high → aggressive, in the cold direction). Guessing high
-is safe for the first and unsafe for the second. This is mitigated, not solved: the
-reading now vetoes any colder setpoint while the room is measurably below its zone.
+is safe for the first and unsafe for the second. This is mitigated, not solved, in two
+places — both cold side only, both deferring to the thermometer over the model: the
+error may not be smaller than the reading says (§4), and no colder setpoint may be
+commanded while the room reads below its zone. Neither removes the need for §10.2.
 
 **Getting `K`, `θ`, `τ` properly needs an open-loop step test** — controller disabled,
 setpoint driven deliberately for an hour or two, in an unoccupied room. Nothing in the
@@ -379,11 +426,89 @@ clock burned on commands never issued; disabling the zone latching the last over
 23.0` read from `const.py` defaults rather than from the running configuration, which
 was 25.2.
 
-**9.6 An anti-hunt fix that overshot** — raising the setpoint threshold to 0.81 to
-kill a 24→25→24 limit cycle made the loop three minutes slower to answer a falling
-room. The floor is real; applying it when the room is far out of zone is not.
+**9.6 An anti-hunt fix that overshot, twice.** Raising the setpoint threshold to 0.81
+to kill a 24→25→24 limit cycle made the loop three minutes slower to answer a falling
+room. The floor is real; applying it when the room is out of zone is not. The first
+remedy — collapse the threshold *toward* the floor over 0.3 °C of urgency, and only
+reach the bare half-step once the room is a full step's worth out — kept the worst of
+both. Live 08-07 07:49 that gave a room 0.115 °C out 0.06 °C of relaxation, and it
+waited eight and a half minutes and 0.30 °C of further fall for one step. The
+threshold reaches 0.5 the moment the room is out, or the ramp is doing the deadband's
+job a second time.
+
+**9.7 The 08-07 afternoon stall — four defects, all of them "measure it against what
+the unit is actually doing".** The room sat 0.42 °C below its zone and below its band
+floor, reported as `idle — settles 25.96, inside [25.88, 26.42]`, holding a setpoint of
+25 while the meter showed the unit drawing the same 1 kW it had before the step:
+
+- a setpoint write of 25 was **lost** — the proxy kept reporting 24 for four ticks —
+  and the dwell, stamped on the write, blocked the re-assert for six minutes. Absolute
+  output was supposed to make a lost write self-correcting; the dwell has to agree;
+- the zone deadband was tested on `settled`, so a prediction satisfied it while the
+  thermometer did not. `mode`, `branch`, `reason` and `in_zone` all reported the
+  prediction's opinion of the room as the room;
+- the fine actuators' residual was measured against the setpoint just *chosen*, so it
+  flipped sign the instant a step crossed the demand — one tick commanded a warmer
+  setpoint and more airflow together, and the blower round-tripped 低→中→低 at the
+  dwell period all day;
+- the cold veto was applied to the PI's answer *after* it had integrated, so
+  back-calculation unwound nothing and the loop wound up against a limit it could not
+  see. Every other limit in this design is enforced where anti-windup can see it.
+
+**9.8 The 10:48 restore that never landed, and a wrong first diagnosis.** The overcool
+guard cut power at 10:35, released at 10:48 with `switch.turn_on` + `set_temperature 27`
+— and the unit reported **off** one second later, with the setpoint applied, and stayed
+off for seven minutes until a person called `climate.set_hvac_mode` by hand. The
+controller correctly refused to touch it the whole time (rule 1), and the guard had
+already released, so nothing was left that was allowed to finish.
+
+The first diagnosis was "the switch restores mains and leaves this VRF in standby, so
+the restore must set the mode". **That was wrong, and a live test disproved it**: cut
+with `switch.turn_off`, held two minutes, then `switch.turn_on` alone brought the unit
+to `cool` in five seconds. What differed on 10:48 is that the power-on and the setpoint
+write went out back-to-back in one `apply()` — the same proxy that drops a setpoint
+write (§9.7) mis-applied one issued into a unit that was still coming up.
+
+So the fix is **verification, not the mode**: a restore is re-asserted until the unit
+agrees (§6.5). The mode is set too, because it is cheap, it provably works, and it is
+the only remedy if the unit ever really does come back in standby — but it is not what
+makes the restore work, and a future reader should not believe it is. Worth keeping in
+mind when reading the rest of this document: two consecutive failures on this hardware
+had "one write, unverified" as their root cause, and neither looked like it at first.
 
 ---
+
+**9.9 Inferring the load bias from the setpoint in force — measured worse, twice.**
+The integral carries the whole difference between the reset curve and this room's real
+load, 0.5–0.8 °C of setpoint. Inside the zone the error is exactly zero by design, so
+that bias cannot converge there; and a restart threw it away entirely, which on 08-07
+left the loop demanding 24.32 while the room sat comfortably at 25.81 on a setpoint of
+25. It then spent eleven minutes climbing back to parity with a setpoint it was already
+running, and the room reached the cold rail first.
+
+The obvious remedy is to read the bias off the setpoint that is demonstrably holding
+the room — "comfortable at 25" is a cleaner measurement of the load than a curve fitted
+from another controller's output. **Both forms of it measured worse:**
+
+| | in band | rms | moves/h | worst cold |
+|---|---|---|---|---|
+| neither | **85.6%** | **0.396** | 2.5 | **0.36** |
+| prime the integral from the observed setpoint at startup | 83.0% | 0.434 | 2.7 | 0.98 |
+| …and track it continuously while in zone (τ 180 min) | 82.7% | 0.436 | 2.6 | 0.98 |
+| …τ 60 min | 82.2% | 0.441 | 2.6 | 0.98 |
+| …τ 20 min | 82.0% | 0.443 | 2.5 | 0.98 |
+
+Monotonic in the wrong direction, and the worst cold excursion nearly triples. Both
+assume the setpoint in force is the right one, and that is **circular**: inside the
+zone the demand sits anywhere within ±0.5 of the integer the loop itself rounded to, so
+pulling the demand toward that integer makes a cold rounding self-confirming. Priming
+fails the same way for a different reason — at startup the setpoint in force is whatever
+was there before, including whatever error put it there.
+
+What is left is the part that was never circular: **persist the integral** across a
+restart, aged out after two hours. It is the loop's own value, earned from real error,
+and nothing else in the loop needs to survive a restart. It does not appear in the table
+above because replay never restarts — which is exactly why the gap survived this long.
 
 ## 10. Open questions for a reviewer
 
@@ -400,21 +525,52 @@ Ranked by how much they would improve things.
 3. **Is the blower worth anything thermally?** `g = 0` today. A step test would
    answer it, and a non-zero `g` would make the split-range design do what it was
    designed for instead of degrading to setpoint-plus-fan.
-4. **Should the setpoint envelope widen below 24?** At 33 °C outdoor the fitted curve
-   asks for 23.5 — below the floor — so the loop saturates and the fine actuators
-   carry everything. This is a comfort decision for an infant's room and belongs to
-   the owner, not the model.
-5. **The fan is commanded from the quantisation residual**, which is a rounding
-   artefact, not a statement about where the room is. It can therefore run while the
-   room is cold. Worth restructuring so the fan reads the room directly.
+4. **The reset curve does not explain this room's load, and 08-07 says so twice.**
+   At local noon, outdoor 30.5, the loop was pinned at setpoint 24 with 中风 and the
+   fan at 30 while the room ran 26.66 → 27.55 into the hot rail over 34 minutes; the
+   guard's blast to 22 recovered it, so the load genuinely wanted ~22. Four hours
+   later, outdoor **32.2**, the same room was overcooling at setpoint 25. `u_ff` read
+   24.09 and 24.25 across those two states. A −0.21 °C/outdoor-°C line cannot produce
+   a 3 °C swing that runs *opposite* to outdoor temperature, so the residual is
+   larger than the term itself — and the "dominant term" is mostly not the dominant
+   term. Candidates: solar gain through the window (invisible today, §5.3 of SIGNALS),
+   or shared-condenser capacity, since a VRF's indoor unit gets less when the other
+   rooms are demanding. Re-run `fit.py` now that a runaway is in the history; its
+   hour-of-day verdict (§3) is the one measured conclusion this data argues against.
+5. **The setpoint envelope 24–27 is too narrow at BOTH ends, and 08-07 showed both.**
+   At noon the room reached the hot rail with the floor exhausted and the guard's 22
+   fixed it. That same evening the mirror image: room 25.47 and falling, 0.19 below its
+   zone, with the loop's demand at 25.89 — *below* the 26 already running — and the
+   cold veto the only thing stopping it going colder still. It was `pi.at_ceiling` at
+   27 earlier in the same hour. **At setpoint 27, its warmest allowed value, this unit
+   still overcools this room.** The climate entity's own return air reads 22–23 °C
+   against a room of 25.5, which is what a unit delivering far more than the load looks
+   like.
+
+   That has a consequence worth stating plainly: when the envelope's ceiling is still
+   colder than the load wants, **no setpoint-based controller can hold the cold side**,
+   and the only remaining lever is to stop the unit — which rule 6.2 forbids the
+   controller from touching. So the overcool guard cutting power is not the guard
+   failing; it is the system running out of actuator and falling back to the one lever
+   left. Raising `setpoint_max` toward the device's 32 is the cheap experiment, and it
+   can only ever reduce cooling. Both ends are comfort decisions for an infant's room
+   and belong to the owner, not the model, which is why nothing here has changed them.
 6. **The zone's blindness is still a trade.** At `INNER_ZONE_FRAC = 0.5` the loop sees
-   no error across 0.325 °C of drift. Centre-measured error mostly compensates, but a
-   reviewer should check the cold side specifically — the worst cold excursion is the
-   metric that matters, not mean band fit. Choosing 0.5 on band fit alone is what
-   produced the worst cold excursion of every value tested.
+   no error across 0.325 °C of drift. Centre-measured error mostly compensates, and on
+   the cold side the reading now floors the error outright (§4), but a reviewer should
+   still check the cold side specifically — the worst cold excursion is the metric that
+   matters, not mean band fit. Choosing 0.5 on band fit alone is what produced the
+   worst cold excursion of every value tested.
 7. **`hard_min`/`hard_max` are room °C sitting numerically next to setpoint °C.**
    Deriving the rails from the band would remove two numbers that can be misread —
    at the cost of removing the owner's direct control over them.
+8. **Power's sign is right for this unit and possibly wrong for this meter.** More
+   draw than baseline reads as "more cooling arriving, ease off". But the persistence
+   gate deliberately filters out *this* unit's duty cycle, which preferentially admits
+   another room starting — and on a shared condenser another room starting means less
+   capacity here, i.e. the opposite. Bounded at ±0.4 °C so it cannot do much either
+   way. Unchanged, because flipping a bounded feedforward on a hypothesis is how this
+   project got into trouble before; settle it with the other rooms' AC state (#1).
 
 ---
 
@@ -438,9 +594,11 @@ against it, which assumes linear superposition and the un-identified gain. Judge
 change on the recorded baseline and on the **worst cold excursion**, not on mean band
 fit alone.
 
-Two harness traps worth not reintroducing: the fan must be *simulated* (pinning it on
-leaves the loop reading far calmer and colder than it is), and the recorded baseline
-must use the same band definition as the simulated arm.
+Three harness traps worth not reintroducing: the fan must be *simulated* (pinning it on
+leaves the loop reading far calmer and colder than it is); the recorded baseline must
+use the same band definition as the simulated arm; and **both arms must feed the
+observed setpoint transition back** with `Controller.note_setpoint_change`, or the
+compressor dwell never starts and every moves/h figure is fiction (§7).
 
 A backend change needs a **full HA restart** — a config-entry reload does not
 re-import changed modules. The card is a resource-version bump.

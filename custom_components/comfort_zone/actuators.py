@@ -70,6 +70,20 @@ async def apply(hass: "HomeAssistant", b: Bindings, cmd: Command) -> list[str]:
         )
         done.append(f"ac_power={'on' if cmd.set_ac_power else 'off'}")
 
+    # …then the running mode, so a unit that came back in standby is started rather
+    # than merely powered. Cutting power still goes through the switch alone — the VRF
+    # acknowledges an hvac_mode of "off" without acting on it. Order matters on the
+    # way back: mode before setpoint, so the setpoint lands on a unit that is already
+    # running. Issued together on 08-07 10:48, a power-on and an immediate setpoint
+    # write left it reporting off with the setpoint applied.
+    if cmd.set_hvac_mode is not None:
+        await hass.services.async_call(
+            "climate", "set_hvac_mode",
+            {"entity_id": b.ac_climate, "hvac_mode": cmd.set_hvac_mode},
+            blocking=True,
+        )
+        done.append(f"hvac_mode={cmd.set_hvac_mode}")
+
     if cmd.set_setpoint is not None:
         await hass.services.async_call(
             "climate",

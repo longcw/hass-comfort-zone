@@ -23,9 +23,21 @@ a veto.
 | **bounds** | none applied — see the gap noted at the end |
 | **failure mode** | can go quiet ~10 min (BLE). Handled as *staleness*, not as a value: hold, then park after 30 min. Rails keep applying. |
 
-**It also holds a veto.** If the reading says the room is below its zone, no colder
-setpoint may be commanded, whatever the model believes is on the way. The model can be
-wrong about the future; the thermometer cannot be wrong about the present.
+**It also holds a veto, and a floor.** If the reading says the room is below its zone,
+no colder setpoint may be commanded and the error may not be smaller than the reading
+says, whatever the model believes is on the way. The model can be wrong about the
+future; the thermometer cannot be wrong about the present. Both are cold side only: on
+the warm side, letting the reading override a prediction is how v1–v4 stacked commands
+into the dead time. The veto is enforced as the loop's own floor, where anti-windup can
+see it — applied to the answer afterwards it was a limit the integrator wound up
+against.
+
+**Everything that reports the room reports the reading, not the prediction.** `mode`,
+`branch`, `reason` and the `in_zone` flag are about where the thermometer says the room
+is; `settled_in_zone` is the prediction's separate opinion. Tested on `settled` alone,
+a room 0.42 °C below its zone read `idle — settles 25.96, inside [25.88, 26.42]` on the
+card (live 08-07 16:10). A prediction is why the loop is patient; it is not a
+description of the room and must not be shown as one.
 
 ---
 
@@ -91,13 +103,18 @@ on its own — that, not downstream correction, is the safety argument.
 |---|---|
 | **source** | **observed** setpoint transitions, not our commands |
 | **enters at** | `model.remaining_effect` → `predict_settled` → the error |
-| **bounds** | steps clamped to ±5 °C before the predictor sees them |
+| **bounds** | steps clamped to ±5 °C before the predictor sees them; the error it produces is floored by the reading on the cold side (§1) |
 
 Driven from what the unit reports because the room responds to what the unit is
 actually running at — and because this VRF's cloud proxy re-reports its own remembered
 setpoint (7 of 30 transitions on 08-06 were never commanded). The clamp exists because
 a glitched report of 5 or 50 would otherwise carry ±12 °C of imaginary cooling for
 fifty minutes.
+
+**Three other things read the observed setpoint rather than our command,** all for the
+same reason and all after a live failure: the compressor dwell (a write the proxy
+dropped is not a compressor that moved), the blower's residual and the fan's — a
+setpoint only just written delivers nothing until it arrives.
 
 ---
 
@@ -138,7 +155,8 @@ Ranked by expected value.
    Subtracting them would turn the whole-house meter into something close to this
    room's own draw, and let `power.py` act sooner and harder than its ±0.4 °C cap
    permits. **The largest unexploited signal in the system.**
-2. **The AC's own return-air temperature**, if the integration exposes it. A second,
+2. **The AC's own return-air temperature.** It is exposed — see §6 — as
+   `current_temperature` on the climate entity the coordinator already reads. A second,
    faster thermal measurement would shorten the effective dead time.
 3. **Cloud coverage / UV**, on the same weather entity. Solar gain is a real load on a
    room with windows and is currently invisible; outdoor temperature is a lagging
@@ -163,9 +181,19 @@ Stated plainly so a reviewer does not have to find them.
   has no cap of its own, while the integral that would argue back is limited to ±5 °C.
 - **`device_min_temp` is trusted as reported** and only ever raises the guard's blast
   setpoint, never lowers it. A bogus high value makes an overheat blast *warmer*.
-- **The fan is commanded from the quantisation residual**, a rounding artefact rather
-  than a statement about the room, so it can run while the room is cold.
+- **The fan and blower are still sized from a residual, not from the room.** It is now
+  the residual against the setpoint in force, so it no longer flips on quantisation and
+  no longer runs the fan at a cold room — but it is still a rounding quantity, and the
+  fine actuators reading the room directly would be a better answer.
 - **Compressor dwell is not persisted** across a restart, so a setpoint can move
-  seconds after the previous process moved it.
+  seconds after the previous process moved it. The PI integral now is (aged out after
+  two hours), because losing it meant resuming on the reset curve alone — 0.5–0.8 °C of
+  setpoint too cold on this room, and measured live as an eleven-minute walk to the cold
+  rail. Reading that bias off the setpoint in force instead is circular; see DESIGN §9.9.
 - **The overheat rail is unreachable during an overcool hold** (the release check
   returns first). Bounded to ~3 minutes in practice, structurally wrong.
+- **The AC's own `current_temperature` is available and unused.** Ranked #2 above with
+  an "if the integration exposes it"; it does — `climate.…_ktf` reports it (22 °C while
+  the room read 25.5), in the same attributes the coordinator already parses for
+  `temperature` and `fan_mode`. Return air is not room air, but it is a second thermal
+  measurement that moves in minutes rather than in a dead time.

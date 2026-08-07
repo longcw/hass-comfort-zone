@@ -43,11 +43,15 @@ class ZoneStore:
     # -- model --------------------------------------------------------------
     @property
     def model(self) -> dict:
-        return dict(self._data.get("model", MODEL_DEFAULTS))
+        """Read-only. Nothing in the integration writes this key.
 
-    async def set_model(self, model: dict) -> None:
-        self._data["model"] = dict(model)
-        await self._save()
+        The plant constants are fitted offline by ``tools/fit.py`` and edited into
+        ``const.MODEL_DEFAULTS`` by a person who has read what that fit says it
+        cannot identify — the edit *is* the review, and a write path would be a way
+        around it. What remains here is the pre-v5 online adapter's store, still on
+        disk and still discarded on load; see ``ModelParams.from_dict``.
+        """
+        return dict(self._data.get("model", MODEL_DEFAULTS))
 
     # -- schedule (48 × 30-min points), per strategy ------------------------
     def schedule_for(self, strategy: str) -> list[float]:
@@ -79,6 +83,36 @@ class ZoneStore:
         idx = (hour * 60 + minute) // 30
         idx = max(0, min(SCHEDULE_POINTS - 1, idx))
         return float(self.schedule_for(strategy)[idx])
+
+    # -- the loop's earned state --------------------------------------------
+    def integral(self, max_age_min: float) -> float | None:
+        """The PI integral this loop had converged on, if it is still fresh.
+
+        The one piece of loop state not recomputed each tick, and worth 0.5–0.8 °C of
+        setpoint on this room: the whole difference between the reset curve's guess at
+        the load and the load the room really has. Thrown away on restart, the loop
+        resumes on the curve alone and walks the room toward its cold rail while it
+        re-earns the difference.
+
+        Aged out rather than trusted forever — a load estimate from before an
+        eight-hour outage describes yesterday's weather, and the loop is better off
+        starting from the curve than from that.
+        """
+        rec = self._data.get("pi") or {}
+        try:
+            value, at = float(rec["integral"]), rec["at"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        from homeassistant.util import dt as dt_util
+        stamped = dt_util.parse_datetime(at)
+        if stamped is None:
+            return None
+        age_min = (dt_util.utcnow() - stamped).total_seconds() / 60.0
+        return value if 0 <= age_min <= max_age_min else None
+
+    async def set_integral(self, value: float, at: str) -> None:
+        self._data["pi"] = {"integral": float(value), "at": at}
+        await self._save()
 
     # -- switch state -------------------------------------------------------
     def flag(self, key: str, default: bool = True) -> bool:

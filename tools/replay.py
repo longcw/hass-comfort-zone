@@ -274,10 +274,12 @@ def replay_window(hist, t0, t1, a, label=""):
         chist.append((t, y))
         cst = state_at(hist.get(CLIMATE), t)
         sp_now = int(round(at(sp_obs, t))) if at(sp_obs, t) is not None else None
-        # the predictor is driven from OBSERVED transitions, as the coordinator does
+        # the predictor and the compressor dwell are both driven from OBSERVED
+        # transitions, as the coordinator does
         if sp_now is not None and sp_now != seen_sp:
             if seen_sp is not None:
                 ctl.predictor.record_setpoint_change(t, sp_now - seen_sp)
+                ctl.note_setpoint_change(t)
             seen_sp = sp_now
         zp = zone_params(target_of(t), a)
         sig = Signals(
@@ -324,6 +326,11 @@ def replay_window(hist, t0, t1, a, label=""):
         if out.set_setpoint is not None and out.set_setpoint != sp_cur:
             plant.steps.append((t, float(out.set_setpoint - sp_cur)))
             ctl2.predictor.record_setpoint_change(t, out.set_setpoint - sp_cur)
+            # Starts the compressor dwell, so the simulated arm is paced like the
+            # real one. Without it nothing here ever started that clock and the arm
+            # reported a moves/h figure the hardware would never have allowed —
+            # which is how a 3.0/h claim came out of an unpaced loop.
+            ctl2.note_setpoint_change(t)
             sp_cur = out.set_setpoint
             sim_moves += 1
         if out.set_blower_idx is not None:

@@ -90,6 +90,10 @@ class Signals:
     forecast: list[tuple[datetime, float]] | None = None
     power: float | None = None           # W, display only — never a control input
     ac_on: bool = False
+    # The running mode the unit reports ("cool", "dry", …), None while it is off.
+    # Remembered by the guard before it cuts power, so a restore puts back the mode
+    # the owner had rather than one this integration picked.
+    hvac_mode: str | None = None
     setpoint: int | None = None
     blower_idx: int | None = None
     fan_on: bool = False
@@ -146,6 +150,14 @@ class Command:
     set_setpoint: int | None = None
     set_blower_idx: int | None = None
     set_ac_power: bool | None = None
+    # The running mode to put back, only ever alongside ``set_ac_power=True``. The
+    # switch usually suffices on its own (tested: on → cool in 5 s), so this is not
+    # what makes a restore work — it is what makes one *complete*, for the case where
+    # the unit does come back in standby. On 08-07 10:48 it came back reporting off
+    # and stayed off for seven minutes; nothing but a person could fix that, because
+    # the controller may not switch an AC on. See safety.STATE_RESTORING for the part
+    # that actually recovers it.
+    set_hvac_mode: str | None = None
     set_fan: bool | None = None
     set_fan_level: int | None = None
     # A stable id for what decided this, comparable across ticks where the reason
@@ -165,8 +177,14 @@ class Controller:
         self._last_ff: float | None = None
 
     def note_setpoint_change(self, at: datetime) -> None:
-        """Told by the caller when the UNIT's setpoint actually changed."""
+        """Told by the caller when the UNIT's setpoint actually changed.
+
+        This is what starts the compressor dwell, and it is the only thing that
+        may: the dwell paces a machine, and the machine moved when the unit
+        changed, not when we asked it to.
+        """
         self.power.note_setpoint_change(at)
+        self.split.note_setpoint_change(at)
 
     def zone(self, p: ZoneParams) -> tuple[float, float]:
         """The inner comfort zone the loop actively holds.
@@ -203,7 +221,7 @@ class Controller:
         return centre - half, centre + half
 
     @staticmethod
-    def zone_error(settled: float, lo: float, hi: float) -> float:
+    def zone_error(settled: float, y: float, lo: float, hi: float) -> float:
         """Zero inside the zone; outside, the distance to its CENTRE.
 
         The step at the boundary is deliberate and is the whole point. Measuring to
@@ -220,10 +238,29 @@ class Controller:
 
         Sign matches the point-tracking convention: positive means the room needs
         to be warmer, so the setpoint rises.
+
+        **On the cold side the error may not be smaller than the reading says.**
+        ``settled`` credits every in-flight step with a full ``gain_per_step`` of
+        effect, and that constant is a prior deliberately set at the top of its
+        plausible range — safe where it divides into ``Kc``, aggressive where it
+        multiplies here, and the two uses want opposite errors. Measured live
+        08-07: a 24→25 step drew the same 1 kW as before it, so nothing was on the
+        way, yet the model had already shaved 0.24 °C off the error and the loop
+        sat at 25 with the room 0.55 °C below its zone and still falling.
+
+        So a prediction may shrink the error that answers a warm room — feeding
+        back a reading that will not move for a dead time is how v1–v4 stacked
+        commands into the lag — but it may never talk the loop out of warming a
+        room the thermometer says is cold. Same rule as the cold veto below, one
+        stage earlier: the model can be wrong about what is coming, the
+        thermometer cannot be wrong about the present. Cold side only, because
+        that is where a wrong answer is dangerous and where it cannot stack.
         """
-        if lo <= settled <= hi:
-            return 0.0
-        return (lo + hi) / 2.0 - settled
+        centre = (lo + hi) / 2.0
+        error = 0.0 if lo <= settled <= hi else centre - settled
+        if y < lo:
+            error = max(error, centre - y)
+        return error
 
     def tick(self, s: Signals, p: ZoneParams) -> Command:
         dt_min = 0.0
@@ -242,7 +279,7 @@ class Controller:
         # zone's centre is the load it should be sized for.
         target = (zone_lo + zone_hi) / 2.0
         settled = self.predictor.predict_settled(s.now, y)
-        error = self.zone_error(settled, zone_lo, zone_hi)
+        error = self.zone_error(settled, y, zone_lo, zone_hi)
 
         # --- feedforward: the setpoint this load calls for ---------------------
         ff = reset.feedforward(s.now, target, s.outdoor, s.forecast, m)
@@ -269,31 +306,36 @@ class Controller:
 
         # --- feedback: the residual, on the dead-time-free error ---------------
         lo, hi = self.split.deliverable(p)
-        frozen = s.guard_active or not s.ac_on
-        out = self.pi.step(error=error, u_ff=ff, dt_min=dt_min,
-                           lo=lo, hi=hi, frozen=frozen)
-
         # NEVER ASK FOR A COLDER SETPOINT WHILE THE THERMOMETER SAYS THE ROOM IS
         # ALREADY COLD. `settled` can sit above the zone during a recovery purely
         # because the model believes warming it has already commanded is on the
-        # way — and it believes that on the strength of `gain_per_step`, a PRIOR
-        # set deliberately at the top of its plausible range. That constant DIVIDES
-        # into Kc, where guessing high is gentle, but it MULTIPLIES in
-        # remaining_effect, where guessing high is aggressive and points at the
-        # cold. The two uses want opposite errors. Between a model that may be
-        # wrong about what is coming and a thermometer reading where the room is
-        # now, the thermometer wins.
-        cold_veto = y < zone_lo and s.setpoint is not None and out.u_raw < s.setpoint
-        if cold_veto:
-            out.u_raw = max(out.u_raw, float(s.setpoint))
-            out.u = max(out.u, min(hi, float(s.setpoint)))
+        # way, on the strength of a gain prior that is aggressive in exactly this
+        # direction (see zone_error). Between a model that may be wrong about what
+        # is coming and a thermometer reading where the room is now, the
+        # thermometer wins.
+        #
+        # It goes in as the loop's own FLOOR rather than as a patch on the answer.
+        # A limit the integrator cannot see is a limit it winds up against: applied
+        # afterwards, back-calculation unwound nothing, so the integral kept
+        # travelling toward cold for the whole veto and handed the room a wound-up
+        # demand the moment it lifted. Every other limit in this design is enforced
+        # where anti-windup can see it, and so is this one.
+        veto_floor = float(s.setpoint) if y < zone_lo and s.setpoint is not None else None
+        frozen = s.guard_active or not s.ac_on
+        out = self.pi.step(error=error, u_ff=ff, dt_min=dt_min,
+                           lo=lo, hi=hi, floor=veto_floor, frozen=frozen)
+        cold_veto = veto_floor is not None and out.u_raw < max(lo, min(hi, veto_floor))
+        # The output stage spends the UNCLAMPED demand, so that saturation reaches
+        # the fine actuators — but not past the veto: a cold room does not want the
+        # blower and fan working harder either.
+        u_demand = out.u if cold_veto else out.u_raw
 
         # --- output stage ------------------------------------------------------
         # How far the ROOM is outside its zone, which is what makes a setpoint
         # move urgent. Measured on the reading, not the prediction: the predictor
         # can believe help is coming while the thermometer keeps falling.
         urgency = max(0.0, zone_lo - y, y - zone_hi)
-        sp = self.split.resolve(out.u_raw, s.now, s.setpoint, s.blower_idx, p,
+        sp = self.split.resolve(u_demand, s.now, s.setpoint, s.blower_idx, p,
                                 s.fan_on, urgency)
         # Pinned at a limit, and by how much the demand still exceeds it. The first
         # is the state worth reporting; the second is transient detail (see LIMIT_EPS).
@@ -306,7 +348,11 @@ class Controller:
         cmd.trace = {
             "y": y, "settled": settled, "slope": s.slope or 0.0, "target": target,
             "zone_lo": zone_lo, "zone_hi": zone_hi,
-            "in_zone": zone_lo <= settled <= zone_hi,
+            # `in_zone` is about the ROOM. It used to be about `settled`, and a row
+            # reading "in_zone, error 0, no action" was then indistinguishable from
+            # a room sitting half a degree out while the model insisted help was
+            # coming — which is what 08-07 08:10 actually was.
+            "in_zone": urgency == 0.0, "settled_in_zone": zone_lo <= settled <= zone_hi,
             "error": out.error, "u_ff": out.u_ff, "u_fb": out.u_fb,
             "u": out.u, "u_raw": out.u_raw, "integral": out.integral,
             # `saturated` means "pinned at a limit with no headroom", which is what
@@ -355,27 +401,49 @@ class Controller:
             cmd.set_setpoint = sp.setpoint
         self._apply_fine(cmd, s, p, sp)
 
-        cmd.mode = (MODE_COOLING if settled > zone_hi
+        # What the room is doing outranks what the model expects of it. Reported off
+        # `settled` alone, a room 0.42 °C below its zone read "idle — settles 25.96,
+        # inside [25.88, 26.42]" on the card while the thermometer sat below the band
+        # floor (live, 08-07 08:10). The prediction is why the loop is patient; it is
+        # not a description of the room, and it must not be shown as one.
+        cmd.mode = (MODE_EASING if y < zone_lo
+                    else MODE_COOLING if y > zone_hi
+                    else MODE_COOLING if settled > zone_hi
                     else MODE_EASING if settled < zone_lo else MODE_IDLE)
         if at_limit:
             cmd.branch = "pi.at_floor" if at_floor else "pi.at_ceiling"
             edge = "floor" if at_floor else "ceiling"
+            # The limit's own value, not the setpoint being held. Printing the
+            # setpoint here read "at the setpoint floor (27)" while the floor was 24
+            # and 27 was merely what the dwell had not let go of yet (live 11:11).
+            limit = lo if at_floor else hi
             more = (f", still asking {shortfall:.1f}°C past it"
                     if shortfall > LIMIT_EPS else "")
+            held = (f"; unit still at {sp.setpoint}, pacing the compressor "
+                    f"({sp.sp_dwell_left:.1f} min left)" if sp.sp_blocked_by_dwell
+                    else f" → setpoint {sp.setpoint}")
             cmd.reason = (
-                f"at the setpoint {edge} ({sp.setpoint}){more} — "
-                + ("comfortable, but no headroom left" if error == 0 else
-                   f"and {abs(error):.2f}°C outside the zone, so it cannot keep up"))
+                f"demand at the {edge} of what this unit delivers ({limit:.0f})"
+                f"{more} — "
+                + ("comfortable, but no headroom left" if urgency == 0.0 else
+                   f"and the room is {urgency:.2f}°C outside the zone, "
+                   f"so it cannot keep up")
+                + held)
         elif sp.sp_blocked_by_dwell:
             cmd.branch = "pi.dwell"
             cmd.reason = (f"want setpoint {out.u:.1f}, pacing the compressor "
                           f"({sp.sp_dwell_left:.1f} min left) → holding {sp.setpoint}")
         else:
-            cmd.branch = "pi.track" if out.error else "pi.in_zone"
+            # Three states, not two. `pi.waiting` is the room outside its zone with
+            # no error to act on because the model says the answer is already in
+            # flight — an honest and useful thing to see, and the state that used to
+            # be filed under "in_zone".
+            cmd.branch = ("pi.track" if out.error
+                          else "pi.in_zone" if urgency == 0.0 else "pi.waiting")
             where = (f"settles {settled:.2f}, inside [{zone_lo:.2f}, {zone_hi:.2f}]"
-                     if not out.error else
-                     f"settles {settled:.2f}, {abs(out.error):.2f} outside "
-                     f"[{zone_lo:.2f}, {zone_hi:.2f}]")
+                     if urgency == 0.0 else
+                     f"room {y:.2f} is {urgency:.2f} outside "
+                     f"[{zone_lo:.2f}, {zone_hi:.2f}] (settles {settled:.2f})")
             cmd.reason = (f"{where} → u {out.u:.2f} = ff {out.u_ff:.2f} "
                           f"{out.u_fb:+.2f} fb → setpoint {sp.setpoint}")
         if cmd.mode == MODE_IDLE and (cmd.set_fan or cmd.set_fan_level is not None):
@@ -391,8 +459,14 @@ class Controller:
             cmd.set_fan_level = sp.fan_level
 
     def _apply_fine(self, cmd: Command, s: Signals, p: ZoneParams, sp) -> None:
-        """Emit the blower and fan commands, only where they differ from the device."""
-        if p.blower_levels and sp.blower_idx != (s.blower_idx if s.blower_idx is not None else 0):
+        """Emit the blower and fan commands, only where they differ from the device.
+
+        A blower the unit reports as something off our ladder — "自动" is in this
+        VRF's ``fan_modes`` and is not an intensity — is not level 0, it is unknown.
+        Read as 0 it matched every request for 0, so nothing was ever issued and the
+        unit stayed on auto for good.
+        """
+        if p.blower_levels and sp.blower_idx != s.blower_idx:
             cmd.set_blower_idx = sp.blower_idx
         if sp.fan_on != s.fan_on:
             cmd.set_fan = sp.fan_on

@@ -30,7 +30,7 @@
 // where the registry is available, with entity-id substitution as a fallback.
 
 (() => {
-  const VERSION = "0.3.2";
+  const VERSION = "0.3.3";
 
   // --- semantic palette (mid-chroma so it reads on light AND dark surfaces) ---
   const C = {
@@ -49,7 +49,6 @@
     cooling: { label: "Cooling", color: C.cool },
     easing: { label: "Easing", color: C.teal },
     fan_assist: { label: "Fan assist", color: C.teal },
-    managed_off: { label: "AC off", color: C.grey },
     safety_overheat: { label: "Overheat guard", color: C.amber },
     safety_overcool: { label: "Overcool guard", color: C.danger },
     stale_hold: { label: "Sensor stale", color: C.amber },
@@ -444,6 +443,14 @@
       flags.push([C.grey, "frozen",
         "integration paused — the guard has the room, or the AC is off"]);
     }
+    if (d.cold_veto) {
+      // The reading overruling the model. Worth its own flag: the demand shown
+      // below is one the loop was held to, not one it chose.
+      flags.push([C.teal, "cold veto",
+        `the room reads below its zone, so nothing colder than the setpoint the `
+        + `unit already holds (${d.sp_observed ?? d.sp}) may be commanded, `
+        + `whatever the model expects`]);
+    }
     const flagHtml = flags.length
       ? `<div class="wflags">${flags.map(([c, k, why]) =>
         `<span class="wflag" style="--c:${c}">${k} <span class="wfx">${esc(why)}</span></span>`).join("")}</div>`
@@ -464,14 +471,19 @@
     if (Math.abs(offset - mid) > 0.005) why.push(`${sg2(offset - mid)} no fan`);
     rows.push(row("zone", `${f2(d.zone_lo)} – ${f2(d.zone_hi)}`
       + (why.length ? ` (${why.join(", ")})` : ""), `band ${f1(d.lo)}–${f1(d.hi)}`));
-    // Inside the zone the loop is deliberately doing nothing, which is the state a
-    // reader is most likely to misread as broken. Say it, rather than showing a
-    // bare 0 and leaving the conclusion to them.
+    // A zero error is the state a reader is most likely to misread as broken, so
+    // say WHY it is zero. Two very different reasons: the room is comfortable, or
+    // the room is out and the model says the answer is already on its way. The
+    // second used to be shown as the first.
     const err = fnum(d.error);
-    const inZone = d.in_zone ?? (err === 0);
-    rows.push(inZone
-      ? row("error", "0 — settles inside the zone", "✓ nothing to correct", "ok")
-      : row("error", `${sg2(d.error)} to the nearest zone edge`,
+    const settledIn = d.settled_in_zone ?? (err === 0);
+    rows.push(err === 0
+      ? row("error", settledIn && d.in_zone !== false
+          ? "0 — the room is inside the zone"
+          : "0 — out of zone, but the model says the answer is in flight",
+        settledIn && d.in_zone !== false ? "✓ nothing to correct" : "waiting",
+        settledIn && d.in_zone !== false ? "ok" : "warn")
+      : row("error", `${sg2(d.error)} to the zone centre`,
         err == null ? "" : err > 0 ? "too cold" : "too warm",
         err == null ? "" : err > 0 ? "cool" : "warn"));
 

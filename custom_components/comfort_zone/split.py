@@ -63,11 +63,10 @@ from datetime import datetime
 # reintroduce the limit cycle.
 SP_HYSTERESIS = 0.15        # the minimum, used when the floor is lower
 SP_HYSTERESIS_MARGIN = 0.15  # clearance above the floor, so it is not marginal
-# Once the room is outside its comfort zone the threshold collapses toward this,
-# reaching it URGENT_SPAN °C out. Half a step is the least it can ever be: below
-# that the nearest integer is by definition already the right one.
+# The threshold once the room is outside its comfort zone. Half a step is the least
+# it can ever be: below that the nearest integer is by definition already the right
+# one, so there is nothing a smaller threshold could buy.
 SP_MIN_THRESHOLD = 0.5
-URGENT_SPAN = 0.3
 # Minutes between setpoint commands. Hardware, about the compressor, never relaxed.
 SP_DWELL_MIN = 6.0
 # Minutes between blower changes, and how far past a level boundary the demand must
@@ -108,6 +107,23 @@ class SplitRange:
         self._last_sp_at: datetime | None = None
         self._last_blower_at: datetime | None = None
 
+    def note_setpoint_change(self, at: datetime) -> None:
+        """Start the compressor dwell, on the UNIT's own setpoint transition.
+
+        Not on our write. This VRF's setpoint goes through a cloud proxy that
+        acknowledges a ``set_temperature`` and then keeps reporting its remembered
+        value; measured 08-07 07:58, a write of 25 was lost and the unit reported 24
+        for four consecutive ticks. Stamped on the write, the dwell then blocked the
+        re-assert for its full six minutes while the room fell another 0.26 °C —
+        pacing a compressor that had not moved.
+
+        Absolute output was supposed to make that self-correcting ("write it if it
+        differs from what the unit reports"), and it is, but only if the dwell agrees
+        about what "moved" means. The dwell paces a machine, so it starts when the
+        machine changes.
+        """
+        self._last_sp_at = at
+
     def sp_threshold(self, urgency: float = 0.0) -> float:
         """How far the demand must sit from the setpoint before it moves.
 
@@ -132,31 +148,32 @@ class SplitRange:
             base = max(base, floor + SP_HYSTERESIS_MARGIN)
         if urgency <= 0.0:
             return base
-        # The collapse target is the anti-hunting floor while the room is only
-        # mildly out — and the bare half-step once it is far enough out that the
-        # floor's own argument no longer applies.
+        # Once the room is out, the threshold is the bare half-step — at once, not
+        # ramped, and with no intermediate hold at the anti-hunting floor.
         #
-        # That argument is about a step landing no closer than it started, which can
-        # only happen when one step is comparable to the whole error. Once the room
-        # is more than a step's worth of room temperature outside its zone — one
-        # setpoint level is `gain_per_step` °C of room — a full step is unambiguously
-        # in the right direction and cannot be reversed by its own arrival. Holding
-        # the floor there buys nothing and costs minutes, measured: three of them,
-        # and 0.16 °C of extra fall, on the 08-07 trajectory.
-        floor = SP_MIN_THRESHOLD
-        step_worth = SP_MIN_THRESHOLD
-        if self.model is not None:
-            floor = max(SP_MIN_THRESHOLD,
-                        (1.0 + self.model.kc * self.model.gain_per_step) / 2.0)
-            step_worth = max(0.1, self.model.gain_per_step)
-        target = floor if urgency < step_worth else SP_MIN_THRESHOLD
-        frac = min(1.0, urgency / URGENT_SPAN)
-        return base - (base - target) * frac
+        # The floor's argument is that a step is answered by Kc·K of demand against
+        # itself, so a step from too close lands no nearer than it started. That
+        # answer only exists while the loop still has an error to feel: a step that
+        # returns the room to its zone produces exactly ZERO error, which is what the
+        # zone is for. Outside the zone the argument therefore does not apply, and
+        # below half a step there is nothing left to argue about — the nearest
+        # integer is by definition already the right one.
+        #
+        # Ramping it was measured worse than either endpoint. With the ramp spread
+        # over URGENT_SPAN and held at the floor until a full step's worth of room
+        # temperature, the threshold went 0.81 → 0.75 across the whole range that
+        # matters and only reached 0.5 once the room was half a degree out — past its
+        # band floor and a fifth of a degree off the cold rail. Live 08-07 07:49
+        # that cost eight and a half minutes and 0.30 °C of further fall before one
+        # step was allowed.
+        return SP_MIN_THRESHOLD
 
-    def commit(self, now: datetime, setpoint_issued: bool, blower_issued: bool) -> None:
-        """Start the dwell clocks, for commands the caller actually applied."""
-        if setpoint_issued:
-            self._last_sp_at = now
+    def commit(self, now: datetime, blower_issued: bool) -> None:
+        """Start the blower dwell, for a command the caller actually applied.
+
+        The blower has no cloud proxy in the way and no compressor behind it, so the
+        write is the event. The setpoint's clock is :meth:`note_setpoint_change`.
+        """
         if blower_issued:
             self._last_blower_at = now
 
@@ -194,26 +211,32 @@ class SplitRange:
         else:
             sp = want
         sp = int(max(lo, min(hi, sp)))
-        # NOTE: the dwell clock is stamped by the caller once the command is really
-        # issued, not here. Stamping on "my chosen setpoint differs from the
-        # device's" burned the dwell on moves that never happened — during a guard
-        # override, or while the unit was off — so the compressor pacing was spent
-        # before the controller got the room back.
+        # NOTE: the dwell clock is stamped from the unit's own setpoint transition,
+        # neither here nor from our write — see note_setpoint_change.
 
         # --- fine: the blower takes the residual ------------------------------
+        # Measured against the setpoint the unit is RUNNING, not the one just
+        # chosen. The residual is what the coarse actuator is failing to deliver
+        # right now, and a setpoint only just written delivers nothing until it
+        # arrives a dead time later. Read off the chosen setpoint it flipped sign in
+        # the same tick as any step that crossed the demand: live 08-07 07:58 one
+        # tick asked for a warmer setpoint AND more airflow at once, and the blower
+        # round-tripped 低→中→低 at the dwell period all day.
+        #
         # With a fitted gain the level is computed outright. Without one the
-        # direction is still known — a positive residual means the setpoint we can
-        # command is warmer than the one we want, and more airflow is the answer —
-        # so the blower moves one level at a time on the sign of the residual. That
-        # keeps the lever without inventing a number for how much it is worth.
+        # direction is still known — a positive residual means the setpoint in force
+        # is warmer than the one we want, and more airflow is the answer — so the
+        # blower moves one level at a time on the sign of the residual. That keeps
+        # the lever without inventing a number for how much it is worth.
+        in_force = float(cur_sp) if cur_sp is not None else float(sp)
         free = self._elapsed(self._last_blower_at, now) >= BLOWER_DWELL_MIN
         if g:
-            b_ideal = (sp - u_raw) / g
+            b_ideal = (in_force - u_raw) / g
             b = cur_b
             if free and abs(b_ideal - cur_b) > 0.5 + BLOWER_HYSTERESIS:
                 b = int(round(b_ideal))
         else:
-            residual = sp - u_raw
+            residual = in_force - u_raw
             b = cur_b
             if free and residual > BLOWER_STEP_UP_TRIM:
                 b = cur_b + 1
@@ -226,7 +249,12 @@ class SplitRange:
         b = max(0, min(b_max, b))
 
         # --- finest: the fan carries what is left -----------------------------
-        trim = (sp - b * g) - u_raw
+        # Against the setpoint in force, for the same reason as the blower: a fan
+        # sized off a setpoint that has not arrived is sized off nothing. This is
+        # also what keeps it from running while the room is cold — a room being
+        # eased has the setpoint in force below the demand, so the residual is
+        # negative and there is nothing for the fan to carry.
+        trim = (in_force - b * g) - u_raw
         return SplitOutput(
             setpoint=sp, blower_idx=b, trim=trim,
             sp_blocked_by_dwell=blocked, sp_dwell_left=dwell_left,

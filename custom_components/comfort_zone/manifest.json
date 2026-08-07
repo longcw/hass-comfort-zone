@@ -1,12 +1,16 @@
 {
   "domain": "comfort_zone",
   "name": "Comfort Zone",
-  "codeowners": ["@longcw"],
+  "codeowners": [
+    "@longcw"
+  ],
   "config_flow": true,
-  "dependencies": ["recorder"],
+  "dependencies": [
+    "recorder"
+  ],
   "documentation": "https://github.com/longcw/hass-comfort-zone",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/longcw/hass-comfort-zone/issues",
   "requirements": [],
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
