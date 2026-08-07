@@ -49,7 +49,7 @@
     // (saturated, room above the zone), DARK is the room settled inside the zone
     // with no fan available — the "deliberately doing nothing" state.
     const decision = { y:26.90, settled:26.62, slope:0.031, target:26.05,
-      zone_lo:25.83, zone_hi:26.28, in_zone:false,
+      zone_lo:25.83, zone_hi:26.28, in_zone:false, at_limit:"floor",
       error:-0.34, u_ff:24.62, u_fb:-0.94, u:24.00, u_raw:23.68, integral:-0.51,
       saturated:true, frozen:false,
       sp:24, blower:1, trim:0.32, sp_dwell_left:0.0, sp_blocked_by_dwell:false,
@@ -58,9 +58,9 @@
       sp_observed:24 };
     const decisionInZone = Object.assign({}, decision, {
       y:25.90, settled:25.95, slope:-0.004, target:25.85,
-      zone_lo:25.63, zone_hi:26.08, in_zone:true,
+      zone_lo:25.63, zone_hi:26.08, in_zone:true, at_limit:"floor",
       error:0, u_ff:25.62, u_fb:-0.31, u:25.31, u_raw:25.31, integral:-0.18,
-      saturated:false, sp:25, blower:0, trim:0.00,
+      saturated:true, sp:25, blower:0, trim:0.00,
       sp_dwell_left:4.2, sp_blocked_by_dwell:false, outdoor:29.1, sp_observed:25 });
     const S = "sensor.master_bedroom_status";
     const entMap = {
@@ -71,8 +71,8 @@
     const states = {
       [S]: { entity_id:S, state:"cooling", attributes:{
         friendly_name:"Master bedroom Status",
-        reason:"asking for 23.7, 0.3°C past what the unit can deliver → setpoint 24, blower and fan take the rest",
-        branch:"pi.saturated_cold",
+        reason:"at the setpoint floor (24), still asking 0.3°C past it — and 0.34°C outside the zone, so it cannot keep up",
+        branch:"pi.at_floor",
         decision,
         strategy:"baby", safety_state:"normal", enabled:true, is_night:false,
         slope:0.031, outdoor:33.4, power:1120, power_recent:410, setpoint:24, sp_held_min:4.2,
@@ -108,8 +108,8 @@
     // knobs and the history mock are shared.
     const statesInZone = Object.assign({}, states, {
       [S]: { entity_id:S, state:"idle", attributes:Object.assign({}, states[S].attributes, {
-        reason:"settles 25.95, inside [25.63, 26.08] → u 25.31 = ff 25.62 -0.31 fb → setpoint 25",
-        branch:"pi.in_zone",
+        reason:"at the setpoint floor (25) — comfortable, but no headroom left",
+        branch:"pi.at_floor",
         decision:decisionInZone,
         slope:-0.004, outdoor:29.1, power:640, power_recent:-260, setpoint:25, sp_held_min:80.6,
         fan_level:0, fan_on:false,

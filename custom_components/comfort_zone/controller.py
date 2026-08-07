@@ -63,6 +63,15 @@ MANAGED_OFF_AFTER_MIN = 10.0
 # edge is the classic dead-band failure — the load pushes the room straight back out
 # and the loop cycles on the boundary — so the zone it returns to sits half-way in.
 INNER_ZONE_FRAC = 0.5
+# How close to a deliverable limit counts as sitting ON it.
+#
+# The reportable state is "the output is pinned and has no headroom left", NOT
+# "the demand exceeds what we can deliver". Those look the same for a few minutes
+# and then diverge: back-calculation exists precisely to park the demand at the
+# boundary, so the excess decays to nothing while the loop is still every bit as
+# stuck. Measuring the excess therefore catches only the transient — live, a loop
+# that had been at the floor for 50 minutes reported a shortfall of 0.01 °C.
+LIMIT_EPS = 0.02
 
 
 def regular_blower_top(levels: list[str]) -> int:
@@ -249,6 +258,12 @@ class Controller:
 
         # --- output stage ------------------------------------------------------
         sp = self.split.resolve(out.u_raw, s.now, s.setpoint, s.blower_idx, p, s.fan_on)
+        # Pinned at a limit, and by how much the demand still exceeds it. The first
+        # is the state worth reporting; the second is transient detail (see LIMIT_EPS).
+        at_floor = out.u <= lo + LIMIT_EPS
+        at_ceiling = out.u >= hi - LIMIT_EPS
+        at_limit = at_floor or at_ceiling
+        shortfall = abs(out.u_raw - out.u)
 
         cmd = Command()
         cmd.trace = {
@@ -257,7 +272,13 @@ class Controller:
             "in_zone": zone_lo <= settled <= zone_hi,
             "error": out.error, "u_ff": out.u_ff, "u_fb": out.u_fb,
             "u": out.u, "u_raw": out.u_raw, "integral": out.integral,
-            "saturated": out.saturated, "frozen": out.frozen,
+            # `saturated` means "pinned at a limit with no headroom", which is what
+            # a reader cares about. Whether that is a PROBLEM depends on in_zone:
+            # at the floor and comfortable is merely no headroom left, at the floor
+            # and drifting out is the unit failing to keep up.
+            "saturated": at_limit, "at_limit": "floor" if at_floor
+            else "ceiling" if at_ceiling else None,
+            "shortfall": shortfall, "frozen": out.frozen,
             "sp": sp.setpoint, "trim": sp.trim, "blower": sp.blower_idx,
             "sp_dwell_left": sp.sp_dwell_left,
             "sp_blocked_by_dwell": sp.sp_blocked_by_dwell,
@@ -299,11 +320,15 @@ class Controller:
 
         cmd.mode = (MODE_COOLING if settled > zone_hi
                     else MODE_EASING if settled < zone_lo else MODE_IDLE)
-        if out.saturated:
-            cmd.branch = "pi.saturated_cold" if out.u_raw < lo else "pi.saturated_warm"
-            short = abs(out.u_raw - out.u)
-            cmd.reason = (f"asking for {out.u_raw:.1f}, {short:.1f}°C past what the unit "
-                          f"can deliver → setpoint {sp.setpoint}, blower and fan take the rest")
+        if at_limit:
+            cmd.branch = "pi.at_floor" if at_floor else "pi.at_ceiling"
+            edge = "floor" if at_floor else "ceiling"
+            more = (f", still asking {shortfall:.1f}°C past it"
+                    if shortfall > LIMIT_EPS else "")
+            cmd.reason = (
+                f"at the setpoint {edge} ({sp.setpoint}){more} — "
+                + ("comfortable, but no headroom left" if error == 0 else
+                   f"and {abs(error):.2f}°C outside the zone, so it cannot keep up"))
         elif sp.sp_blocked_by_dwell:
             cmd.branch = "pi.dwell"
             cmd.reason = (f"want setpoint {out.u:.1f}, pacing the compressor "

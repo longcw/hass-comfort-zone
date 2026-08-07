@@ -350,6 +350,41 @@ def test_no_command_when_the_device_already_holds_the_right_setpoint():
           f"on target at the setpoint the load calls for, but it wrote {out.set_setpoint}")
 
 
+def test_being_pinned_at_a_limit_is_what_gets_reported_not_the_excess():
+    """Live regression: 50 min stuck at the floor reported a 0.01 °C shortfall.
+
+    Back-calculation parks the demand ON the boundary, so the excess decays away
+    while the loop is every bit as stuck. The state worth reporting is the pin.
+    """
+    c, p = fresh(), params()
+    out, sp = run(c, p, 40, comfort=26.0, outdoor=33.0, setpoint=24)
+    d = out.trace
+    check(d["shortfall"] < 0.1,
+          f"anti-windup should have parked the demand at the limit, got "
+          f"{d['shortfall']:.3f} — if this grows, back-calculation is broken")
+    check(d["saturated"] and d["at_limit"] == "floor",
+          f"but it IS pinned at the floor and must say so: {d['at_limit']}")
+    check(sp == p.setpoint_min, f"setpoint sits at the floor, got {sp}")
+    # comfortable at the limit is "no headroom", not "cannot keep up"
+    check(d["in_zone"] and "no headroom" in out.reason,
+          f"in-zone at the limit must not read as failure: {out.reason}")
+
+
+def test_at_the_limit_and_outside_the_zone_reads_as_failing():
+    c, p = fresh(), params()
+    out, _ = run(c, p, 40, comfort=29.0, outdoor=33.0, setpoint=24)
+    check(out.trace["saturated"] and not out.trace["in_zone"],
+          "a room far too hot at the floor is both pinned and outside the zone")
+    check("cannot keep up" in out.reason, f"and must say so: {out.reason}")
+
+
+def test_a_loop_with_headroom_is_not_reported_as_pinned():
+    c, p = fresh(), params()
+    out, _ = run(c, p, 20, comfort=26.0, outdoor=26.0)
+    check(not out.trace["saturated"] and out.trace["at_limit"] is None,
+          f"mid-envelope must not read as pinned: u={out.trace['u']:.2f}")
+
+
 def test_a_hot_day_saturates_the_configured_envelope():
     """A finding, not a preference: 24 is not a low enough floor for a hot day here.
 

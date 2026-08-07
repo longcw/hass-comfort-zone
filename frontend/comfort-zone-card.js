@@ -30,7 +30,7 @@
 // where the registry is available, with entity-id substitution as a fallback.
 
 (() => {
-  const VERSION = "0.3.1";
+  const VERSION = "0.3.2";
 
   // --- semantic palette (mid-chroma so it reads on light AND dark surfaces) ---
   const C = {
@@ -427,10 +427,18 @@
     const del = Array.isArray(d.deliverable) ? d.deliverable : [null, null];
     const flags = [];
     if (d.saturated) {
-      const cold = fnum(d.u_raw) != null && fnum(del[0]) != null && d.u_raw < del[0];
-      flags.push([C.amber, "saturated",
-        `asked ${f2(d.u_raw)}, the unit stops at ${f2(cold ? del[0] : del[1])} — `
-        + `${cold ? "no colder setpoint exists" : "no warmer setpoint exists"}`]);
+      // Pinned at a limit. Whether that is a problem depends entirely on whether
+      // the room is still comfortable there, so say which — "at the floor" alone
+      // reads as an alarm when most of the time it is simply the end of the range.
+      const floor = d.at_limit !== "ceiling";
+      const edge = floor ? "floor" : "ceiling";
+      flags.push(d.in_zone
+        ? [C.grey, `at the ${edge}`,
+           `setpoint ${d.sp} is as ${floor ? "cold" : "warm"} as this unit goes — `
+           + `comfortable, but there is no headroom left`]
+        : [C.amber, `at the ${edge}`,
+           `setpoint ${d.sp} is as ${floor ? "cold" : "warm"} as this unit goes, `
+           + `and the room is outside the zone — it cannot keep up`]);
     }
     if (d.frozen) {
       flags.push([C.grey, "frozen",
@@ -481,7 +489,8 @@
     // 5. the sum, and what survives the clamp.
     rows.push(row("demand", `ff ${f2(d.u_ff)} ${sg2(d.u_fb)} = ${f2(d.u_raw)} raw`));
     rows.push(row("deliver", `clamp ${f1(del[0])} – ${f1(del[1])} → u ${f2(d.u)}`,
-      d.saturated ? "✗ short" : "✓ fits", d.saturated ? "warn" : "ok"));
+      d.saturated ? (d.in_zone ? "at the limit" : "✗ short") : "✓ fits",
+      d.saturated ? (d.in_zone ? "" : "warn") : "ok"));
 
     // 6. quantisation: one integer setpoint, one blower level, and the fraction
     //    neither can express — which is exactly what the fan is for.
